@@ -1,0 +1,24 @@
+services:
+  # Base de datos PostgreSQL compartida (cada microservicio usará sus propias tablas)
+  db:
+    image: postgres:16                 # Imagen oficial; versión fija para que todo el equipo tenga la misma
+    environment:
+      POSTGRES_PASSWORD: dev           # Contraseña SOLO para desarrollo local
+    volumes:
+      # Monta nuestro script dentro de la carpeta que Postgres ejecuta al crear la BD
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:                       # Docker pregunta cada 3s si Postgres ya acepta conexiones
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 3s
+
+  # Microservicio de Vuelos
+  vuelos:
+    build: ./vuelos                    # Construye la imagen con el Dockerfile de la carpeta vuelos/
+    environment:
+      # "db" es el NOMBRE del servicio de arriba: dentro de Compose los servicios se encuentran por nombre.
+      # (localhost aquí sería el propio contenedor de vuelos, no la BD)
+      DATABASE_URL: postgresql://postgres:dev@db:5432/postgres
+    depends_on:
+      db: { condition: service_healthy }  # No arranca hasta que el healthcheck de db diga "listo"
+    # Sin "ports:" a propósito: este servicio solo debe ser accesible por otros contenedores (el Gateway),
+    # no desde afuera. El frontend habla únicamente con el Gateway GraphQL.
