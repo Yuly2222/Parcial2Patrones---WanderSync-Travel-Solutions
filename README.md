@@ -1,0 +1,1 @@
+# Parcial2Patrones---WanderSync-Travel-Solutions
