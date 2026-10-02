@@ -1,5 +1,18 @@
 -- Este script lo ejecuta Postgres UNA sola vez, al crear la BD por primera vez.
 -- Si lo modifican: docker compose down -v  (borra la BD)  y luego  docker compose up --build
+--
+-- Un solo servidor Postgres, pero UNA BASE DE DATOS POR MICROSERVICIO ("database per service").
+-- Ningún servicio puede hacer JOIN ni una transacción sobre los datos de otro:
+-- justamente por eso necesitamos el patrón SAGA para mantener la consistencia.
+
+CREATE DATABASE vuelos;
+CREATE DATABASE hoteles;
+CREATE DATABASE autos;
+CREATE DATABASE ordenes;
+
+
+-- ===================== VUELOS =====================
+\c vuelos
 
 CREATE TABLE aerolineas (
     id     SERIAL PRIMARY KEY,   -- SERIAL = número que se autoincrementa solo (1, 2, 3...)
@@ -18,3 +31,70 @@ INSERT INTO vuelos (origen, destino, precio) VALUES
     ('BOG', 'MDE', 250000),
     ('BOG', 'CTG', 380000),
     ('MDE', 'SMR', 310000);
+
+-- Reservas de vuelo hechas por la SAGA.
+-- saga_id es PRIMARY KEY = llave de IDEMPOTENCIA: si el orquestador reintenta, no se duplica la reserva.
+-- Nunca se borran filas: la compensación cambia estado a CANCELADA (queda trazabilidad).
+CREATE TABLE reservas (
+    saga_id  UUID PRIMARY KEY,
+    vuelo_id INT  NOT NULL REFERENCES vuelos(id),  -- REFERENCES: no deja reservar un vuelo que no existe
+    estado   TEXT NOT NULL                         -- CONFIRMADA | CANCELADA
+);
+
+
+-- ===================== HOTELES =====================
+\c hoteles
+
+CREATE TABLE hoteles (
+    id           SERIAL PRIMARY KEY,
+    nombre       TEXT NOT NULL,
+    ciudad       TEXT NOT NULL,
+    precio_noche NUMERIC(12, 2) NOT NULL
+);
+INSERT INTO hoteles (nombre, ciudad, precio_noche) VALUES
+    ('Hotel Poblado Plaza', 'MDE', 280000),
+    ('Hotel Caribe',        'CTG', 450000),
+    ('Hotel Irotama',       'SMR', 390000);
+
+CREATE TABLE reservas (
+    saga_id  UUID PRIMARY KEY,
+    hotel_id INT  NOT NULL REFERENCES hoteles(id),
+    estado   TEXT NOT NULL
+);
+
+
+-- ===================== AUTOS =====================
+\c autos
+
+CREATE TABLE autos (
+    id         SERIAL PRIMARY KEY,
+    modelo     TEXT NOT NULL,
+    ciudad     TEXT NOT NULL,
+    precio_dia NUMERIC(12, 2) NOT NULL
+);
+INSERT INTO autos (modelo, ciudad, precio_dia) VALUES
+    ('Kia Picanto',    'MDE', 120000),
+    ('Renault Duster', 'CTG', 180000),
+    ('Chevrolet Onix', 'SMR', 150000);
+
+CREATE TABLE reservas (
+    saga_id UUID PRIMARY KEY,
+    auto_id INT  NOT NULL REFERENCES autos(id),
+    estado  TEXT NOT NULL
+);
+
+
+-- ===================== ÓRDENES (orquestador SAGA) =====================
+\c ordenes
+
+-- Una fila por cada SAGA. Se actualiza en CADA paso: es la "bitácora" del orquestador
+-- y la evidencia para la demo (se ve en qué paso iba y cómo terminó).
+CREATE TABLE sagas (
+    id          UUID PRIMARY KEY,
+    vuelo_id    INT  NOT NULL,
+    hotel_id    INT  NOT NULL,
+    auto_id     INT  NOT NULL,
+    estado      TEXT NOT NULL,   -- EN_CURSO | CONFIRMADA | COMPENSANDO | COMPENSADA | REQUIERE_ATENCION
+    paso        TEXT,            -- descripción del último paso ejecutado
+    actualizado TIMESTAMPTZ NOT NULL DEFAULT now()
+);

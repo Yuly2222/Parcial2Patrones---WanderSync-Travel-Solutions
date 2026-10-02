@@ -1,5 +1,5 @@
 services:
-  # Base de datos PostgreSQL compartida (cada microservicio usará sus propias tablas)
+  # Servidor PostgreSQL. Dentro tiene UNA base de datos por microservicio (ver db/init.sql).
   db:
     image: postgres:16                 # Imagen oficial; versión fija para que todo el equipo tenga la misma
     environment:
@@ -16,9 +16,50 @@ services:
     build: ./vuelos                    # Construye la imagen con el Dockerfile de la carpeta vuelos/
     environment:
       # "db" es el NOMBRE del servicio de arriba: dentro de Compose los servicios se encuentran por nombre.
-      # (localhost aquí sería el propio contenedor de vuelos, no la BD)
-      DATABASE_URL: postgresql://postgres:dev@db:5432/postgres
+      # (localhost aquí sería el propio contenedor de vuelos, no la BD). El final "/vuelos" = su propia base de datos.
+      DATABASE_URL: postgresql://postgres:dev@db:5432/vuelos
     depends_on:
       db: { condition: service_healthy }  # No arranca hasta que el healthcheck de db diga "listo"
-    # Sin "ports:" a propósito: este servicio solo debe ser accesible por otros contenedores (el Gateway),
-    # no desde afuera. El frontend habla únicamente con el Gateway GraphQL.
+    # Sin "ports:" a propósito: solo accesible por otros contenedores, no desde afuera.
+
+  # Microservicio de Hoteles
+  hoteles:
+    build: ./hoteles
+    environment:
+      DATABASE_URL: postgresql://postgres:dev@db:5432/hoteles
+    depends_on:
+      db: { condition: service_healthy }
+
+  # Microservicio de Autos
+  autos:
+    build: ./autos
+    environment:
+      DATABASE_URL: postgresql://postgres:dev@db:5432/autos
+      # Interruptor de la demo de fallo. Toma el valor de la variable FORZAR_FALLO_AUTOS
+      # de la terminal (o de un archivo .env); si no existe, vale "false".
+      FORZAR_FALLO_AUTOS: ${FORZAR_FALLO_AUTOS:-false}
+    depends_on:
+      db: { condition: service_healthy }
+
+  # Microservicio de Órdenes = orquestador de la SAGA
+  ordenes:
+    build: ./ordenes
+    environment:
+      DATABASE_URL: postgresql://postgres:dev@db:5432/ordenes
+    depends_on:
+      db: { condition: service_healthy }
+      vuelos: { condition: service_started }
+      hoteles: { condition: service_started }
+      autos: { condition: service_started }
+
+  # API Gateway GraphQL: ÚNICO servicio con puerto expuesto hacia afuera.
+  # El frontend solo habla con él. GraphiQL: http://localhost:8000/graphql
+  gateway:
+    build: ./gateway
+    depends_on:
+      vuelos: { condition: service_started }
+      hoteles: { condition: service_started }
+      autos: { condition: service_started }
+      ordenes: { condition: service_started }
+    ports:
+      - "8000:8000"                    # "puerto_de_tu_PC:puerto_del_contenedor"
