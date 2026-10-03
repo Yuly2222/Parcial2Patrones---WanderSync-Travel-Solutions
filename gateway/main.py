@@ -6,9 +6,12 @@
 # solo esos, en una sola petición (en vez de llamar a 3 endpoints REST y descartar datos).
 import asyncio
 import httpx
+import psycopg
 import strawberry
 from fastapi import FastAPI
 from strawberry.fastapi import GraphQLRouter
+
+import seguridad   # Argon2id, sesiones (Session Fixation) y Rate Limiting -> ver seguridad.py
 
 # Direcciones internas de los microservicios (nombres de servicio en docker-compose)
 VUELOS = "http://vuelos:8000"
@@ -35,6 +38,8 @@ class Hotel:
     nombre: str
     ciudad: str
     precio_noche: float
+    rating: float | None   # calificación 0-10 (los hoteles semilla no tienen)
+    fuente: str            # "semilla" o "hostelworld" (dato real obtenido por el scraper)
 
 
 @strawberry.type
@@ -60,6 +65,13 @@ class Orden:
     saga_id: str
     estado: str                # CONFIRMADA | COMPENSADA | REQUIERE_ATENCION | EN_CURSO...
     paso: str | None = None    # "| None" = campo opcional (puede venir vacío)
+
+
+# Usuario autenticado (nunca se expone el hash de la contraseña)
+@strawberry.type
+class Usuario:
+    id: int
+    email: str
 
 
 # ---------------- QUERIES (lecturas) ----------------
@@ -105,14 +117,65 @@ class Query:
         d = r.json()
         return Orden(saga_id=d["saga_id"], estado=d["estado"], paso=d["paso"])
 
+    @strawberry.field(description="Usuario de la sesión actual (null si no hay sesión)")
+    async def yo(self, info: strawberry.Info) -> Usuario | None:
+        u = await seguridad.usuario_actual(info)
+        return Usuario(id=u[0], email=u[1]) if u else None
+
 
 # ---------------- MUTATIONS (escrituras) ----------------
 
 @strawberry.type
 class Mutation:
 
-    @strawberry.mutation(description="Reserva un paquete completo. Dispara la SAGA en el servicio de Órdenes")
-    async def reservar_paquete(self, vuelo_id: int, hotel_id: int, auto_id: int) -> Orden:
+    @strawberry.mutation(description="Crea una cuenta. Contraseña de 10 a 128 caracteres")
+    async def registrar(self, info: strawberry.Info, email: str, password: str) -> Usuario:
+        seguridad.limitar(info, "3/minute", "registro", seguridad.ip_cliente(info))
+        email = email.strip().lower()
+        if "@" not in email or len(email) > 254:
+            raise ValueError("Email inválido")
+        # Máximo 128: sin tope, alguien podría mandar contraseñas de megas y saturar la CPU con Argon2
+        if not 10 <= len(password) <= 128:
+            raise ValueError("La contraseña debe tener entre 10 y 128 caracteres")
+        password_hash = await seguridad.hashear_password(password)
+        async with await psycopg.AsyncConnection.connect(seguridad.DB) as conn:
+            cur = await conn.execute(
+                "INSERT INTO usuarios (email, password_hash) VALUES (%s, %s) "
+                "ON CONFLICT (email) DO NOTHING RETURNING id",
+                (email, password_hash),
+            )
+            fila = await cur.fetchone()
+        if fila is None:
+            raise ValueError("No se pudo registrar con ese email")
+        return Usuario(id=fila[0], email=email)
+
+    @strawberry.mutation(description="Inicia sesión. Emite una cookie de sesión NUEVA (anti Session Fixation)")
+    async def iniciar_sesion(self, info: strawberry.Info, email: str, password: str) -> Usuario:
+        email = email.strip().lower()
+        # Dos límites contra fuerza bruta: por IP (un atacante, muchas cuentas)
+        # y por email (muchas IPs atacando la misma cuenta)
+        seguridad.limitar(info, "5/minute", "login-ip", seguridad.ip_cliente(info))
+        seguridad.limitar(info, "10/15minutes", "login-email", email)
+        async with await psycopg.AsyncConnection.connect(seguridad.DB) as conn:
+            cur = await conn.execute("SELECT id, password_hash FROM usuarios WHERE email = %s", (email,))
+            fila = await cur.fetchone()
+        # Se verifica SIEMPRE (aunque el email no exista) para que el tiempo de respuesta no revele nada
+        if not await seguridad.verificar_password(fila[1] if fila else None, password):
+            raise ValueError("Credenciales inválidas")   # mensaje genérico: no dice si falló el email o la clave
+        await seguridad.crear_sesion(info, fila[0])
+        return Usuario(id=fila[0], email=email)
+
+    @strawberry.mutation(description="Cierra la sesión actual")
+    async def cerrar_sesion(self, info: strawberry.Info) -> bool:
+        await seguridad.cerrar_sesion(info)
+        return True
+
+    @strawberry.mutation(description="Reserva un paquete completo (requiere sesión). Dispara la SAGA en Órdenes")
+    async def reservar_paquete(self, info: strawberry.Info, vuelo_id: int, hotel_id: int, auto_id: int) -> Orden:
+        # Checkout: ruta sensible -> rate limit + autenticación obligatoria
+        seguridad.limitar(info, "10/minute", "checkout", seguridad.ip_cliente(info))
+        if await seguridad.usuario_actual(info) is None:
+            raise PermissionError("Debes iniciar sesión para reservar")
         # timeout amplio: si hay que compensar con reintentos, la SAGA puede tardar varios segundos
         async with httpx.AsyncClient(timeout=60) as cliente:
             r = await cliente.post(

@@ -1,0 +1,8 @@
+prefect>=3,<4
+prefect-dask
+distributed
+bokeh
+httpx
+beautifulsoup4
+protego
+psycopg[binary]

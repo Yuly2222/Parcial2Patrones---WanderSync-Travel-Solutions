@@ -56,10 +56,64 @@ services:
   # El frontend solo habla con él. GraphiQL: http://localhost:8000/graphql
   gateway:
     build: ./gateway
+    environment:
+      DATABASE_URL: postgresql://postgres:dev@db:5432/auth   # usuarios y sesiones
+      COOKIE_SECURE: "false"           # "true" en producción con HTTPS
     depends_on:
+      db: { condition: service_healthy }
       vuelos: { condition: service_started }
       hoteles: { condition: service_started }
       autos: { condition: service_started }
       ordenes: { condition: service_started }
     ports:
       - "8000:8000"                    # "puerto_de_tu_PC:puerto_del_contenedor"
+
+  # ===================== INGESTA: Prefect + Dask + scraper =====================
+  # Los 4 servicios usan la misma imagen (carpeta ingesta/) con distinto "command".
+
+  # Servidor de Prefect: guarda el historial de flows/tareas y sirve el panel web
+  prefect-server:
+    build: ./ingesta
+    command: prefect server start --host 0.0.0.0
+    environment:
+      # URL que usa el NAVEGADOR (desde tu PC) para hablar con la API de Prefect
+      PREFECT_UI_API_URL: http://localhost:4200/api
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')"]
+      interval: 5s
+      retries: 20
+    ports:
+      - "4200:4200"                    # Panel de Prefect: http://localhost:4200
+
+  # Scheduler de Dask: recibe las tareas y las reparte entre los workers
+  dask-scheduler:
+    build: ./ingesta
+    command: dask scheduler
+    ports:
+      - "8787:8787"                    # Panel de Dask: http://localhost:8787
+
+  # Workers de Dask: ejecutan las tareas (descargar, estructurar, limpiar, guardar)
+  dask-worker:
+    build: ./ingesta
+    command: dask worker tcp://dask-scheduler:8786 --nthreads 2
+    deploy:
+      replicas: 2                      # 2 contenedores worker -> computación distribuida real
+    environment:
+      DATABASE_URL: postgresql://postgres:dev@db:5432/hoteles   # la tarea "guardar" corre aquí
+      PREFECT_API_URL: http://prefect-server:4200/api           # las tareas reportan su estado a Prefect
+      PROB_FALLO_SCRAPER: ${PROB_FALLO_SCRAPER:-0}              # demo de retries (ver README)
+    depends_on:
+      dask-scheduler: { condition: service_started }
+      db: { condition: service_healthy }
+
+  # El flow: se registra en Prefect, se programa cada 30 min y envía sus tareas al clúster de Dask
+  ingesta:
+    build: ./ingesta
+    command: python flow.py
+    environment:
+      DATABASE_URL: postgresql://postgres:dev@db:5432/hoteles
+      PREFECT_API_URL: http://prefect-server:4200/api
+      DASK_SCHEDULER: tcp://dask-scheduler:8786
+    depends_on:
+      prefect-server: { condition: service_healthy }   # sin servidor de Prefect el flow no puede registrarse
+      dask-worker: { condition: service_started }

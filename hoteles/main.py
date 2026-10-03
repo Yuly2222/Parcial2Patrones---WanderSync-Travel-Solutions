@@ -19,10 +19,14 @@ def health():
 def listar_hoteles(ciudad: str | None = None):
     with psycopg.connect(DB) as conn:
         filas = conn.execute(
-            "SELECT id, nombre, ciudad, precio_noche FROM hoteles WHERE %s::text IS NULL OR ciudad = %s",
+            "SELECT id, nombre, ciudad, precio_noche, rating, fuente FROM hoteles "
+            "WHERE %s::text IS NULL OR ciudad = %s ORDER BY rating DESC NULLS LAST",
             (ciudad, ciudad),
         ).fetchall()
-    return [{"id": f[0], "nombre": f[1], "ciudad": f[2], "precio_noche": f[3]} for f in filas]
+    return [
+        {"id": f[0], "nombre": f[1], "ciudad": f[2], "precio_noche": f[3], "rating": f[4], "fuente": f[5]}
+        for f in filas
+    ]
 
 
 class Reserva(BaseModel):

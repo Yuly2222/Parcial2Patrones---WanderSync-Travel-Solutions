@@ -9,6 +9,7 @@ CREATE DATABASE vuelos;
 CREATE DATABASE hoteles;
 CREATE DATABASE autos;
 CREATE DATABASE ordenes;
+CREATE DATABASE auth;      -- usuarios y sesiones (la usa el Gateway)
 
 
 -- ===================== VUELOS =====================
@@ -49,8 +50,14 @@ CREATE TABLE hoteles (
     id           SERIAL PRIMARY KEY,
     nombre       TEXT NOT NULL,
     ciudad       TEXT NOT NULL,
-    precio_noche NUMERIC(12, 2) NOT NULL
+    precio_noche NUMERIC(12, 2) NOT NULL,
+    rating       NUMERIC(4, 2),                    -- calificación 0-10 (puede no existir)
+    url          TEXT UNIQUE,                      -- página de origen; UNIQUE = llave para el UPSERT del scraper
+                                                   -- (re-scrapear actualiza el precio en vez de duplicar el hotel)
+    fuente       TEXT NOT NULL DEFAULT 'semilla',  -- 'semilla' (datos de prueba) | 'hostelworld' (scraping real)
+    actualizado  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Datos semilla: permiten probar el sistema aunque el scraper aún no haya corrido.
 INSERT INTO hoteles (nombre, ciudad, precio_noche) VALUES
     ('Hotel Poblado Plaza', 'MDE', 280000),
     ('Hotel Caribe',        'CTG', 450000),
@@ -97,4 +104,23 @@ CREATE TABLE sagas (
     estado      TEXT NOT NULL,   -- EN_CURSO | CONFIRMADA | COMPENSANDO | COMPENSADA | REQUIERE_ATENCION
     paso        TEXT,            -- descripción del último paso ejecutado
     actualizado TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+
+-- ===================== AUTH (usuarios y sesiones del Gateway) =====================
+\c auth
+
+CREATE TABLE usuarios (
+    id            SERIAL PRIMARY KEY,
+    email         TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,          -- hash Argon2id (incluye sal y parámetros); NUNCA la contraseña
+    creado        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Sesiones del lado del servidor. El navegador solo guarda un token aleatorio en una cookie;
+-- aquí se guarda el SHA-256 de ese token (si alguien roba la BD, no obtiene tokens utilizables).
+CREATE TABLE sesiones (
+    id         TEXT PRIMARY KEY,                                          -- SHA-256 del token de la cookie
+    usuario_id INT  NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    expira     TIMESTAMPTZ NOT NULL
 );

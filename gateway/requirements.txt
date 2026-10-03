@@ -2,3 +2,6 @@ fastapi
 uvicorn
 strawberry-graphql
 httpx
+psycopg[binary]
+argon2-cffi
+limits
