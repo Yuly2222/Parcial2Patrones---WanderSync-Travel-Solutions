@@ -1,4 +1,6 @@
 prefect>=3,<4
+# SQLAlchemy 2.1 rompe el programador de Prefect Server ("Can't evaluate bulk DML statement"): se fija la 2.0
+sqlalchemy>=2.0,<2.1
 prefect-dask
 distributed
 bokeh

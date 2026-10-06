@@ -59,6 +59,8 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:dev@db:5432/auth   # usuarios y sesiones
       COOKIE_SECURE: "false"           # "true" en producción con HTTPS
+      # El rate limiting solo cree la cabecera X-Real-IP si viene de este servicio (ver seguridad.py)
+      PROXY_CONFIABLE: frontend
     depends_on:
       db: { condition: service_healthy }
       vuelos: { condition: service_started }
@@ -67,6 +69,16 @@ services:
       ordenes: { condition: service_started }
     ports:
       - "8000:8000"                    # "puerto_de_tu_PC:puerto_del_contenedor"
+
+  # Frontend React (compilado) servido por nginx. nginx reenvía /graphql al Gateway:
+  # el navegador ve un solo origen y el frontend nunca habla con otro microservicio.
+  # Interfaz: http://localhost:3000
+  frontend:
+    build: ./frontend
+    depends_on:
+      gateway: { condition: service_started }
+    ports:
+      - "3000:80"
 
   # ===================== INGESTA: Prefect + Dask + scraper =====================
   # Los 4 servicios usan la misma imagen (carpeta ingesta/) con distinto "command".
@@ -78,6 +90,12 @@ services:
     environment:
       # URL que usa el NAVEGADOR (desde tu PC) para hablar con la API de Prefect
       PREFECT_UI_API_URL: http://localhost:4200/api
+      # Historial de Prefect en PostgreSQL (BD "prefect"), no en su SQLite por defecto: con 2 workers de Dask
+      # escribiendo a la vez, SQLite responde "database is locked" y se pierden task runs y logs del panel.
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://postgres:dev@db:5432/prefect
+      PREFECT_SERVER_ANALYTICS_ENABLED: "false"   # sin telemetría hacia Prefect
+    depends_on:
+      db: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')"]
       interval: 5s
@@ -110,6 +128,9 @@ services:
   ingesta:
     build: ./ingesta
     command: python flow.py
+    volumes:
+      # Muestras de Trivago guardadas desde el navegador: agregar una no exige reconstruir la imagen
+      - ./ingesta/muestras:/app/muestras
     environment:
       DATABASE_URL: postgresql://postgres:dev@db:5432/hoteles
       PREFECT_API_URL: http://prefect-server:4200/api

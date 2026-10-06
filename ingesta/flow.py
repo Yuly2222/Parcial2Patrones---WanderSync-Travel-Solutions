@@ -5,8 +5,11 @@
 #   Dask    = la "cuadrilla": un scheduler que reparte las tareas entre varios workers
 #             (contenedores dask-worker) que las ejecutan EN PARALELO (panel: http://localhost:8787).
 #
-# Fuente: Hostelworld (plataforma comercial real de reservas de hostales).
-# Se eligió porque su robots.txt PERMITE las páginas de ciudad (/hostels/...) y no responde con desafíos anti-bot.
+# Fuente 1: Hostelworld (plataforma comercial real de reservas de hostales), descargada en vivo.
+#           Su robots.txt PERMITE las páginas de ciudad (/hostels/...) y no responde con desafíos anti-bot.
+# Fuente 2: Trivago (trivago.com.co), descargado en vivo: páginas de destino /es-CO/odr/..., que su
+#           robots.txt permite (ver trivago.py). Si Trivago bloquea al bot en una ciudad, se usa como
+#           RESPALDO la página de esa ciudad guardada a mano en muestras/trivago/.
 # (Booking.com se probó primero: responde con un desafío anti-bot de AWS WAF; evadirlo no es aceptable.)
 #
 # Scraping responsable:
@@ -20,6 +23,7 @@ import random
 import re
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import psycopg
@@ -28,8 +32,10 @@ from bs4 import BeautifulSoup     # parser de HTML
 # NO se usa urllib.robotparser (librería estándar) porque es antiguo: no entiende comodines (* y $)
 # y convierte la regla "Disallow: /s?" en "Disallow: /s", bloqueando por error todas las rutas /st/...
 from protego import Protego
-from prefect import flow, task
+from prefect import flow, task, unmapped
 from prefect_dask import DaskTaskRunner
+
+import trivago   # fuente 2: Trivago, descarga en vivo + muestras guardadas de respaldo (ver trivago.py)
 
 UA = "WanderSync-academic-bot/0.1 (proyecto universitario)"
 BASE = "https://www.hostelworld.com"
@@ -41,22 +47,25 @@ DB = os.environ["DATABASE_URL"]                                  # BD "hoteles"
 DASK_SCHEDULER = os.environ["DASK_SCHEDULER"]                    # tcp://dask-scheduler:8786
 # Demo de retries: probabilidad (0 a 1) de simular un fallo de red al descargar. 0 = desactivado.
 PROB_FALLO = float(os.environ.get("PROB_FALLO_SCRAPER", "0"))
+# Carpeta con las páginas de Trivago guardadas a mano (montada como volumen: agregar una muestra no exige rebuild)
+MUESTRAS_TRIVAGO = Path(os.environ.get("MUESTRAS_TRIVAGO", "muestras/trivago"))
 
 
 # ---------------------------------------------------------------- TAREAS
 # @task convierte la función en una tarea de Prefect: queda registrada (estado, duración, logs)
 # y, gracias al DaskTaskRunner del flow, se ejecuta en un worker de Dask y no en este contenedor.
 
-# retries=3 + retry_delay_seconds: si falla, Prefect la reintenta 3 veces esperando 5s, 15s y 45s
-# (backoff: cada espera es mayor, para no saturar un sitio que quizá está caído).
-@task(retries=3, retry_delay_seconds=[5, 15, 45])
-def descargar(codigo: str) -> str:
-    """Paso 1 (scraping): descarga el HTML de la página de hostales de una ciudad."""
-    url = f"{BASE}/hostels/south-america/colombia/{CIUDADES[codigo]}/"
+class Bloqueado(RuntimeError):
+    """El sitio rechazó al bot (403/429 o desafío anti-bot). No se evade ni se reintenta."""
+
+
+def obtener_html(base: str, url: str) -> str:
+    """Descarga responsable, común a todas las fuentes en vivo:
+    lee robots.txt, se identifica honestamente y falla si el sitio se defiende."""
     headers = {"User-Agent": UA, "Accept-Language": "es-CO,es;q=0.9"}
 
     # 1. Respetar robots.txt: si el sitio no permite esa ruta a los bots, no se descarga.
-    robots = httpx.get(f"{BASE}/robots.txt", headers=headers, timeout=15)
+    robots = httpx.get(f"{base}/robots.txt", headers=headers, timeout=15)
     reglas = Protego.parse(robots.text)
     if not reglas.can_fetch(url, UA):
         raise PermissionError(f"robots.txt no permite descargar {url}")
@@ -67,12 +76,41 @@ def descargar(codigo: str) -> str:
 
     # 3. Descarga real
     r = httpx.get(url, headers=headers, timeout=20, follow_redirects=True)
-    r.raise_for_status()   # 4xx/5xx -> excepción -> Prefect reintenta
+    if r.status_code in (401, 403, 429):
+        # Un rechazo explícito NO es un fallo de red: reintentar sería insistir contra la voluntad del sitio
+        raise Bloqueado(f"El sitio rechazó la descarga (HTTP {r.status_code}); no se evade")
+    r.raise_for_status()   # 5xx -> excepción -> Prefect reintenta
 
     # 4. Si el sitio nos pone un desafío anti-bot, fallamos honestamente en vez de intentar evadirlo.
-    if re.search(r"awswaf|captcha|cf-chl", r.text, re.I):
-        raise RuntimeError("El sitio respondió con un desafío anti-bot; no se evade")
+    if trivago.ANTI_BOT.search(r.text):
+        raise Bloqueado("El sitio respondió con un desafío anti-bot; no se evade")
     return r.text
+
+
+# retries=3 + retry_delay_seconds: si falla, Prefect la reintenta 3 veces esperando 5s, 15s y 45s
+# (backoff: cada espera es mayor, para no saturar un sitio que quizá está caído).
+# retry_condition_fn: un bloqueo (Bloqueado / PermissionError) NO se reintenta; un error de red sí.
+def _reintentable(task, task_run, state) -> bool:
+    try:
+        state.result()
+    except (Bloqueado, PermissionError):
+        return False
+    except Exception:
+        return True
+    return False
+
+
+@task(retries=3, retry_delay_seconds=[5, 15, 45], retry_condition_fn=_reintentable)
+def descargar(codigo: str) -> str:
+    """Paso 1 (scraping): descarga el HTML de la página de hostales de una ciudad en Hostelworld."""
+    return obtener_html(BASE, f"{BASE}/hostels/south-america/colombia/{CIUDADES[codigo]}/")
+
+
+@task(retries=3, retry_delay_seconds=[5, 15, 45], retry_condition_fn=_reintentable)
+def descargar_trivago(codigo: str) -> str:
+    """Paso 1 (scraping) en Trivago: descarga la página de destino de una ciudad (/es-CO/odr/...),
+    permitida por su robots.txt. Los hoteles vienen en el HTML del servidor: basta BeautifulSoup."""
+    return obtener_html(trivago.BASE, trivago.BASE + trivago.DESTINOS[codigo])
 
 
 @task
@@ -96,8 +134,22 @@ def estructurar(html: str, codigo: str) -> list[dict]:
             "nombre": nombre.get_text(strip=True),
             "precio": precio.get_text(strip=True),
             "rating": rating.get_text(strip=True) if rating else None,
+            "fuente": "hostelworld",
         }
     return list(hostales.values())
+
+
+@task
+def estructurar_trivago(html: str, codigo: str, origen: str, fuente: str) -> list[dict]:
+    """Paso 2 (estructuración) para Trivago con BeautifulSoup: HTML -> registros.
+    Sirve para la página descargada en vivo (fuente="trivago") y para una muestra guardada a mano
+    (fuente="trivago-muestra"). Corre en un worker de Dask; después pasa por los mismos limpiar() y guardar()."""
+    registros = trivago.parsear(html, codigo, fuente)
+    print(f"{codigo}: {len(registros)} alojamientos leídos de Trivago ({origen})")
+    if not registros:
+        # Página descargada pero sin hoteles reconocibles: Trivago cambió su HTML -> que se note en Prefect
+        raise ValueError(f"{codigo}: 0 hoteles en Trivago ({origen}); revisar los selectores de trivago.py")
+    return registros
 
 
 @task
@@ -130,7 +182,7 @@ def guardar(registros: list[dict], codigo: str) -> int:
         cur.executemany(
             """
             INSERT INTO hoteles (nombre, ciudad, precio_noche, rating, url, fuente, actualizado)
-            VALUES (%(nombre)s, %(ciudad)s, %(precio)s, %(rating)s, %(url)s, 'hostelworld', now())
+            VALUES (%(nombre)s, %(ciudad)s, %(precio)s, %(rating)s, %(url)s, %(fuente)s, now())
             ON CONFLICT (url) DO UPDATE
                SET nombre = EXCLUDED.nombre,
                    precio_noche = EXCLUDED.precio_noche,
@@ -139,7 +191,7 @@ def guardar(registros: list[dict], codigo: str) -> int:
             """,
             registros,
         )
-    print(f"{codigo}: {len(registros)} hostales guardados/actualizados")
+    print(f"{codigo}: {len(registros)} alojamientos guardados/actualizados")
     return len(registros)
 
 
@@ -159,16 +211,48 @@ def ingesta_hoteles(ciudades: list[str] = list(CIUDADES)):
     limpios = limpiar.map(crudos)
     guardados = guardar.map(limpios, ciudades)
 
-    # Resumen: una ciudad que falle (tras agotar sus retries) no tumba a las demás
+    # Fuente 2: Trivago en vivo, la misma cadena de 4 tareas por ciudad, en paralelo con Hostelworld.
+    # unmapped(...) = el mismo valor para todas las ciudades (no se reparte elemento a elemento).
+    htmls_t = descargar_trivago.map(ciudades)
+    crudos_t = estructurar_trivago.map(htmls_t, ciudades, unmapped("en vivo"), unmapped("trivago"))
+    guardados_t = guardar.map(limpiar.map(crudos_t), ciudades)
+
+    # Resumen: una ciudad o fuente que falle (tras agotar sus retries) no tumba a las demás
     total = 0
-    for codigo, futuro in zip(ciudades, guardados):
+    trivago_fallo = []
+    for etiqueta, futuro in [*zip(ciudades, guardados), *((f"{c} (trivago)", g) for c, g in zip(ciudades, guardados_t))]:
         try:
             total += futuro.result()
         except Exception as e:
-            print(f"{codigo}: falló definitivamente -> {e}")
+            print(f"{etiqueta}: falló definitivamente -> {e}")
+            if etiqueta.endswith("(trivago)"):
+                trivago_fallo.append(etiqueta[:3])
+
+    # RESPALDO: para cada ciudad donde Trivago en vivo falló (bloqueo, red, HTML cambiado), se usa la página
+    # guardada a mano en muestras/trivago/ (nombre con el código de ciudad al inicio: MDE-medellin.html).
+    # Se leen aquí y su HTML viaja a los workers de Dask, así los workers no necesitan acceso a la carpeta.
+    respaldo = []
+    for archivo in sorted(MUESTRAS_TRIVAGO.glob("*.html")):
+        codigo = archivo.name[:3].upper()
+        if codigo in trivago_fallo:
+            respaldo.append((codigo, archivo.name, archivo.read_text(encoding="utf-8")))
+    if respaldo:
+        codigos_r = [m[0] for m in respaldo]
+        crudos_r = estructurar_trivago.map(
+            [m[2] for m in respaldo], codigos_r, [f"muestra guardada {m[1]}" for m in respaldo], unmapped("trivago-muestra")
+        )
+        for codigo, futuro in zip(codigos_r, guardar.map(limpiar.map(crudos_r), codigos_r)):
+            try:
+                total += futuro.result()
+            except Exception as e:
+                print(f"{codigo} (muestra de Trivago): falló -> {e}")
+    sin_respaldo = sorted(set(trivago_fallo) - {m[0] for m in respaldo})
+    if sin_respaldo:
+        print(f"Trivago sin datos para {sin_respaldo}: no hay muestra guardada de respaldo (ver muestras/trivago/LEEME.md)")
+
     if total == 0:
         raise RuntimeError("No se pudo ingerir ninguna ciudad")   # el flow queda en estado Failed en el panel
-    print(f"TOTAL: {total} hostales ingeridos")
+    print(f"TOTAL: {total} alojamientos ingeridos (Hostelworld + Trivago)")
     return total
 
 

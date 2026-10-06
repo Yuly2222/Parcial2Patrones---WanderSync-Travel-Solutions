@@ -7,6 +7,8 @@ import asyncio
 import hashlib
 import os
 import secrets
+import socket
+import time
 
 import psycopg
 from argon2 import PasswordHasher
@@ -128,9 +130,34 @@ class LimiteExcedido(Exception):
     pass
 
 
+# El frontend (nginx) reenvía /graphql al Gateway. Para el Gateway, esas peticiones vienen de la IP
+# de nginx: si contáramos por esa IP, TODOS los usuarios compartirían un mismo límite (y uno solo
+# podría bloquear a los demás). nginx envía la IP real en la cabecera X-Real-IP.
+# PERO esa cabecera la puede escribir cualquiera: solo se le cree si la petición viene del proxy
+# de confianza (el contenedor "frontend"). Una petición directa a :8000 con X-Real-IP falsa se ignora.
+PROXY_CONFIABLE = os.environ.get("PROXY_CONFIABLE", "")   # nombre del servicio en docker-compose
+_cache_proxy: tuple[float, set[str]] = (0.0, set())
+
+
+def _ips_proxy() -> set[str]:
+    """IPs actuales del proxy de confianza (DNS interno de Docker), cacheadas 30 s."""
+    global _cache_proxy
+    ahora = time.monotonic()
+    if ahora - _cache_proxy[0] > 30:
+        try:
+            ips = {a[4][0] for a in socket.getaddrinfo(PROXY_CONFIABLE, None)}
+        except OSError:   # el contenedor frontend aún no existe o no se configuró
+            ips = set()
+        _cache_proxy = (ahora, ips)
+    return _cache_proxy[1]
+
+
 def ip_cliente(info) -> str:
-    # ponytail: detrás de un proxy/balanceador habría que leer X-Forwarded-For (solo de proxies de confianza)
-    return info.context["request"].client.host
+    request = info.context["request"]
+    ip = request.client.host
+    if PROXY_CONFIABLE and ip in _ips_proxy():
+        return request.headers.get("x-real-ip", ip)
+    return ip
 
 
 def limitar(info, regla: str, *claves: str) -> None:

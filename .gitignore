@@ -1,2 +1,6 @@
 .env
 __pycache__/
+node_modules/
+dist/
+ingesta/muestras/*.html
+ingesta/muestras/*_files/

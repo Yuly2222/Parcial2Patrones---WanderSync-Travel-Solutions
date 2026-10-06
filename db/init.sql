@@ -10,6 +10,7 @@ CREATE DATABASE hoteles;
 CREATE DATABASE autos;
 CREATE DATABASE ordenes;
 CREATE DATABASE auth;      -- usuarios y sesiones (la usa el Gateway)
+CREATE DATABASE prefect;   -- historial de flows, tareas y logs del servidor de Prefect (no es de ningún microservicio)
 
 
 -- ===================== VUELOS =====================
@@ -54,7 +55,7 @@ CREATE TABLE hoteles (
     rating       NUMERIC(4, 2),                    -- calificación 0-10 (puede no existir)
     url          TEXT UNIQUE,                      -- página de origen; UNIQUE = llave para el UPSERT del scraper
                                                    -- (re-scrapear actualiza el precio en vez de duplicar el hotel)
-    fuente       TEXT NOT NULL DEFAULT 'semilla',  -- 'semilla' (datos de prueba) | 'hostelworld' (scraping real)
+    fuente       TEXT NOT NULL DEFAULT 'semilla',  -- 'semilla' (datos de prueba) | 'hostelworld' / 'trivago' (scraping en vivo) | 'trivago-muestra' (respaldo)
     actualizado  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- Datos semilla: permiten probar el sistema aunque el scraper aún no haya corrido.
@@ -101,6 +102,7 @@ CREATE TABLE sagas (
     vuelo_id    INT  NOT NULL,
     hotel_id    INT  NOT NULL,
     auto_id     INT  NOT NULL,
+    personas    INT  NOT NULL DEFAULT 1 CHECK (personas BETWEEN 1 AND 9),
     estado      TEXT NOT NULL,   -- EN_CURSO | CONFIRMADA | COMPENSANDO | COMPENSADA | REQUIERE_ATENCION
     paso        TEXT,            -- descripción del último paso ejecutado
     actualizado TIMESTAMPTZ NOT NULL DEFAULT now()
