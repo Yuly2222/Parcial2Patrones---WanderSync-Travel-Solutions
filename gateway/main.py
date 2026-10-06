@@ -5,6 +5,7 @@
 # cada endpoint. En GraphQL el CLIENTE escribe exactamente los campos que quiere y recibe
 # solo esos, en una sola petición (en vez de llamar a 3 endpoints REST y descartar datos).
 import asyncio
+import math
 import httpx
 import psycopg
 import strawberry
@@ -18,6 +19,17 @@ VUELOS = "http://vuelos:8000"
 HOTELES = "http://hoteles:8000"
 AUTOS = "http://autos:8000"
 ORDENES = "http://ordenes:8000"
+
+# Reglas de capacidad del paquete: el vuelo se cobra por persona; el hotel, por habitación (hasta 2 personas
+# cada una) y el auto, por vehículo (hasta 5 personas cada uno).
+MAX_PERSONAS = 9
+PERSONAS_POR_HABITACION = 2
+PERSONAS_POR_AUTO = 5
+
+
+def validar_personas(personas: int) -> None:
+    if not 1 <= personas <= MAX_PERSONAS:
+        raise ValueError(f"El número de personas debe estar entre 1 y {MAX_PERSONAS}")
 
 
 # ---------------- TIPOS del esquema GraphQL ----------------
@@ -39,7 +51,7 @@ class Hotel:
     ciudad: str
     precio_noche: float
     rating: float | None   # calificación 0-10 (los hoteles semilla no tienen)
-    fuente: str            # "semilla" o "hostelworld" (dato real obtenido por el scraper)
+    fuente: str            # "semilla" | "hostelworld" | "trivago" (scraping en vivo) | "trivago-muestra" (respaldo guardado)
 
 
 @strawberry.type
@@ -56,7 +68,10 @@ class Paquete:
     vuelo: Vuelo
     hotel: Hotel
     auto: Auto
-    precio_total: float
+    personas: int
+    habitaciones: int          # ceil(personas / 2)
+    autos: int                 # ceil(personas / 5)
+    precio_total: float        # vuelo x personas + (hotel x habitaciones + auto x autos) x noches
 
 
 # Resultado de una reserva (el estado de la SAGA)
@@ -65,6 +80,7 @@ class Orden:
     saga_id: str
     estado: str                # CONFIRMADA | COMPENSADA | REQUIERE_ATENCION | EN_CURSO...
     paso: str | None = None    # "| None" = campo opcional (puede venir vacío)
+    personas: int | None = None
 
 
 # Usuario autenticado (nunca se expone el hash de la contraseña)
@@ -80,7 +96,12 @@ class Usuario:
 class Query:
 
     @strawberry.field(description="Paquetes disponibles (vuelo + hotel + auto) hacia una ciudad destino")
-    async def paquetes(self, destino: str, noches: int = 1) -> list[Paquete]:
+    async def paquetes(self, destino: str, noches: int = 1, personas: int = 1) -> list[Paquete]:
+        validar_personas(personas)
+        if not 1 <= noches <= 30:
+            raise ValueError("El número de noches debe estar entre 1 y 30")
+        habitaciones = math.ceil(personas / PERSONAS_POR_HABITACION)
+        autos = math.ceil(personas / PERSONAS_POR_AUTO)
         async with httpx.AsyncClient(timeout=5) as cliente:
             # asyncio.gather lanza las 3 peticiones EN PARALELO (no una tras otra):
             # la respuesta tarda lo que el servicio más lento, no la suma de los tres.
@@ -100,7 +121,11 @@ class Query:
                 vuelo=Vuelo(**v),
                 hotel=Hotel(**h),
                 auto=Auto(**a),
-                precio_total=v["precio"] + (h["precio_noche"] + a["precio_dia"]) * noches,
+                personas=personas,
+                habitaciones=habitaciones,
+                autos=autos,
+                precio_total=v["precio"] * personas
+                + (h["precio_noche"] * habitaciones + a["precio_dia"] * autos) * noches,
             )
             for v in rv.json()
             for h in rh.json()
@@ -115,7 +140,7 @@ class Query:
             return None
         r.raise_for_status()
         d = r.json()
-        return Orden(saga_id=d["saga_id"], estado=d["estado"], paso=d["paso"])
+        return Orden(saga_id=d["saga_id"], estado=d["estado"], paso=d["paso"], personas=d.get("personas"))
 
     @strawberry.field(description="Usuario de la sesión actual (null si no hay sesión)")
     async def yo(self, info: strawberry.Info) -> Usuario | None:
@@ -171,20 +196,23 @@ class Mutation:
         return True
 
     @strawberry.mutation(description="Reserva un paquete completo (requiere sesión). Dispara la SAGA en Órdenes")
-    async def reservar_paquete(self, info: strawberry.Info, vuelo_id: int, hotel_id: int, auto_id: int) -> Orden:
+    async def reservar_paquete(
+        self, info: strawberry.Info, vuelo_id: int, hotel_id: int, auto_id: int, personas: int = 1
+    ) -> Orden:
         # Checkout: ruta sensible -> rate limit + autenticación obligatoria
         seguridad.limitar(info, "10/minute", "checkout", seguridad.ip_cliente(info))
+        validar_personas(personas)
         if await seguridad.usuario_actual(info) is None:
             raise PermissionError("Debes iniciar sesión para reservar")
         # timeout amplio: si hay que compensar con reintentos, la SAGA puede tardar varios segundos
         async with httpx.AsyncClient(timeout=60) as cliente:
             r = await cliente.post(
                 f"{ORDENES}/ordenes",
-                json={"vuelo_id": vuelo_id, "hotel_id": hotel_id, "auto_id": auto_id},
+                json={"vuelo_id": vuelo_id, "hotel_id": hotel_id, "auto_id": auto_id, "personas": personas},
             )
         r.raise_for_status()
         d = r.json()
-        return Orden(saga_id=d["saga_id"], estado=d["estado"])
+        return Orden(saga_id=d["saga_id"], estado=d["estado"], personas=personas)
 
 
 # ---------------- Servidor ----------------

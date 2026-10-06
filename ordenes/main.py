@@ -7,7 +7,7 @@ import uuid
 import httpx                    # Cliente HTTP para llamar a los otros microservicios
 import psycopg
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI()
 DB = os.environ["DATABASE_URL"]  # apunta a la base de datos "ordenes" (tabla sagas)
@@ -17,6 +17,7 @@ class Orden(BaseModel):
     vuelo_id: int
     hotel_id: int
     auto_id: int
+    personas: int = Field(default=1, ge=1, le=9)   # Field valida el rango: fuera de 1-9 FastAPI responde 422
 
 
 def guardar_estado(saga_id, estado, paso):
@@ -54,9 +55,9 @@ def crear_orden(orden: Orden):
     # 1) Registrar la SAGA antes de empezar
     with psycopg.connect(DB) as conn:
         conn.execute(
-            "INSERT INTO sagas (id, vuelo_id, hotel_id, auto_id, estado, paso) "
-            "VALUES (%s, %s, %s, %s, 'EN_CURSO', 'inicio')",
-            (saga_id, orden.vuelo_id, orden.hotel_id, orden.auto_id),
+            "INSERT INTO sagas (id, vuelo_id, hotel_id, auto_id, personas, estado, paso) "
+            "VALUES (%s, %s, %s, %s, %s, 'EN_CURSO', 'inicio')",
+            (saga_id, orden.vuelo_id, orden.hotel_id, orden.auto_id, orden.personas),
         )
 
     # 2) Los pasos de la SAGA, EN ORDEN: (servicio, datos que necesita para reservar)
@@ -89,7 +90,8 @@ def crear_orden(orden: Orden):
             if sin_compensar:
                 # Ni con reintentos se pudo cancelar: nunca rendirse en silencio, queda marcado para un humano
                 estado = "REQUIERE_ATENCION"
-                guardar_estado(saga_id, estado, f"no se pudo cancelar: {sin_compensar}")
+                # Se conserva qué paso falló: el frontend lo usa para dibujar la línea de tiempo
+                guardar_estado(saga_id, estado, f"falló {servicio}; no se pudo cancelar: {sin_compensar}")
             else:
                 estado = "COMPENSADA"
                 guardar_estado(saga_id, estado, f"falló {servicio}; reservas previas canceladas")
@@ -104,7 +106,9 @@ def crear_orden(orden: Orden):
 @app.get("/ordenes/{saga_id}")
 def ver_orden(saga_id: uuid.UUID):
     with psycopg.connect(DB) as conn:
-        fila = conn.execute("SELECT estado, paso, actualizado FROM sagas WHERE id = %s", (saga_id,)).fetchone()
+        fila = conn.execute(
+            "SELECT estado, paso, actualizado, personas FROM sagas WHERE id = %s", (saga_id,)
+        ).fetchone()
     if fila is None:
         raise HTTPException(status_code=404, detail="Orden no encontrada")
-    return {"saga_id": saga_id, "estado": fila[0], "paso": fila[1], "actualizado": fila[2]}
+    return {"saga_id": saga_id, "estado": fila[0], "paso": fila[1], "actualizado": fila[2], "personas": fila[3]}

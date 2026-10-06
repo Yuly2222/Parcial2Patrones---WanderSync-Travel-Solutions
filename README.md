@@ -35,6 +35,7 @@ La primera vez tarda varios minutos (instala Prefect y Dask). Cuando todo esté 
 
 | URL | Qué es |
 |---|---|
+| **http://localhost:3000** | **Frontend** (React): buscar paquetes, iniciar sesión, reservar y ver la SAGA |
 | **http://localhost:8000/graphql** | Editor GraphiQL del API Gateway |
 | **http://localhost:4200** | Panel de Prefect (flows, tareas, reintentos, logs) |
 | **http://localhost:8787** | Panel de Dask (workers y tareas en ejecución) |
@@ -52,25 +53,26 @@ docker compose down -v
 ## 2. Arquitectura
 
 ```
-                  ┌──────────────────────────────┐
-  Frontend ──────►│  Gateway GraphQL  :8000      │   ← única puerta de entrada (único puerto expuesto)
-                  └──────┬───────────────┬───────┘
-          consultas      │               │  mutation reservarPaquete
-     (en paralelo)       ▼               ▼
-        ┌────────┬─────────┬────────┐  ┌──────────────────────┐
-        │ Vuelos │ Hoteles │ Autos  │◄─┤ Órdenes (orquestador │
-        └───┬────┴────┬────┴───┬────┘  │ de la SAGA)          │
-            │         │        │       └──────────┬───────────┘
-            ▼         ▼        ▼                  ▼
-        ┌──────────────── PostgreSQL ──────────────────────┐
-        │  BD vuelos │ BD hoteles │ BD autos │ BD ordenes  │   ← una base de datos por servicio
-        └──────────────────────────────────────────────────┘
-                                ▲ UPSERT en lote (tabla hoteles)
-                                │
-   Prefect Flow ──► Dask scheduler ──► Dask workers (x2) ──► descargar → estructurar → limpiar → guardar
-   (cada 30 min,                                                  │
-    retries, panel :4200)                                         ▼
-                                                     Hostelworld.com (sitio comercial real)
+   Navegador ──► Frontend :3000 (nginx) ──/graphql──►┌──────────────────────────────┐
+                                                     │  Gateway GraphQL  :8000      │  ← única puerta de entrada al backend
+                                                     └──────┬───────────────┬───────┘
+                                             consultas      │               │  mutation reservarPaquete
+                                        (en paralelo)       ▼               ▼
+                                   ┌────────┬─────────┬────────┐  ┌──────────────────────┐
+                                   │ Vuelos │ Hoteles │ Autos  │◄─┤ Órdenes (orquestador │
+                                   └───┬────┴────┬────┴───┬────┘  │ de la SAGA)          │
+                                       │         │        │       └──────────┬───────────┘
+                                       ▼         ▼        ▼                  ▼
+                                   ┌──────────────── PostgreSQL ──────────────────────┐
+                                   │  BD vuelos │ BD hoteles │ BD autos │ BD ordenes  │   ← una base de datos por servicio
+                                   └──────────────────────────────────────────────────┘
+                                                           ▲ UPSERT en lote (tabla hoteles)
+                                                           │
+                              Prefect Flow ──► Dask scheduler ──► Dask workers (x2) ──► descargar → estructurar → limpiar → guardar
+                              (cada 30 min,                                                  │
+                               retries, panel :4200)                                         ▼
+                                                                                Hostelworld.com (sitio comercial real)
+                                                                                + Trivago.com.co (páginas de destino)
 ```
 
 ### Decisiones de diseño (y por qué)
@@ -85,7 +87,8 @@ docker compose down -v
 | **Cancelar = cambiar estado, no borrar** | Queda trazabilidad de lo que pasó. |
 | **Tabla `sagas` como bitácora** | Se actualiza en cada paso: sirve de evidencia y permitiría retomar una SAGA si el orquestador se cae. |
 | **`NUMERIC` para precios, no `FLOAT`** | `FLOAT` redondea en binario (`0.1 + 0.2 = 0.30000000000000004`); con dinero eso descuadra cuentas. |
-| **Solo el Gateway expone puerto** | El frontend no puede saltarse el Gateway; los demás servicios solo son accesibles dentro de la red de Docker. |
+| **Solo el Gateway y el frontend exponen puerto** | Los microservicios (Vuelos, Hoteles, Autos, Órdenes) solo son accesibles dentro de la red de Docker: nadie puede saltarse el Gateway. El 8000 queda abierto para la demo con GraphiQL. |
+| **El frontend llega al Gateway por un proxy (nginx)** | El navegador ve un solo origen (`localhost:3000`) para la página y para `/graphql`: la cookie `SameSite=Strict` funciona sin abrir CORS. |
 | **Credenciales por variables de entorno** | La URL de la BD no está escrita en el código. |
 | **Seguridad centralizada en el Gateway** | Es la única puerta de entrada: autenticación, sesiones y rate limiting se aplican en un solo lugar y nada puede saltárselos. |
 
@@ -103,7 +106,9 @@ docker compose down -v
 ├── ordenes/             # Microservicio de Órdenes  = orquestador SAGA
 ├── gateway/             # API Gateway GraphQL (Strawberry) + seguridad.py
 ├── ingesta/             # Scraper + Prefect Flow + Dask (una imagen para 4 contenedores)
-└── seguridad/           # Script y reporte de auditoría de dependencias (pip-audit)
+├── frontend/            # React + Vite + Tailwind, servido por nginx (proxy de /graphql)
+├── docs/                # Documento técnico de arquitectura
+└── seguridad/           # Scripts y reportes de auditoría de dependencias (pip-audit y npm audit)
 ```
 
 Cada carpeta de servicio tiene:
@@ -183,9 +188,9 @@ sequenceDiagram
 
 | Operación | Tipo | Qué hace |
 |---|---|---|
-| `paquetes(destino, noches)` | Query | Consulta Vuelos, Hoteles y Autos **en paralelo** (`asyncio.gather`), combina y calcula `precioTotal` |
+| `paquetes(destino, noches, personas)` | Query | Consulta Vuelos, Hoteles y Autos **en paralelo** (`asyncio.gather`), combina y calcula `precioTotal`: vuelo × personas + (hotel × habitaciones + auto × autos) × noches, con 2 personas por habitación y 5 por auto |
 | `orden(sagaId)` | Query | Estado de una reserva |
-| `reservarPaquete(vueloId, hotelId, autoId)` | Mutation | Dispara la SAGA en Órdenes (**requiere sesión**) |
+| `reservarPaquete(vueloId, hotelId, autoId, personas)` | Mutation | Dispara la SAGA en Órdenes (**requiere sesión**); `personas` queda guardado en la tabla `sagas` |
 | `registrar`, `iniciarSesion`, `cerrarSesion`, `yo` | Mutation / Query | Autenticación (ver Paso 7) |
 
 **¿Cómo se elimina el over-fetching?** En REST el servidor decide qué campos devuelve. En GraphQL **el cliente pide exactamente los campos que necesita** y recibe solo esos, en una única petición. Además, cada microservicio filtra por ciudad en su propia BD, así que entre servicios tampoco viajan datos innecesarios.
@@ -212,7 +217,8 @@ sequenceDiagram
 |---|---|
 | Booking.com | Responde con un **desafío anti-bot (AWS WAF)**. Descartado: evadirlo no es aceptable. |
 | Kayak | Su `robots.txt` prohíbe `/flights/`, `/hotels/`, `/cars/`. Descartado. |
-| Despegar, Trivago | Responden **403** (bloqueo anti-bot). Descartados. |
+| Despegar | Responde **403** (bloqueo anti-bot). Descartado. |
+| **Trivago** | Su `robots.txt` prohíbe `/*/srl/` (resultados de búsqueda) y `/hotel/`, pero **permite las páginas de destino** `/es-CO/odr/...`, que traen los hoteles en el HTML del servidor. **Elegido como segunda fuente** (ver abajo). |
 | **Hostelworld** | `robots.txt` **permite** `/hostels/...` y la página llega completa. **Elegido.** |
 
 Buenas prácticas aplicadas:
@@ -221,6 +227,25 @@ Buenas prácticas aplicadas:
 - `User-Agent` honesto que identifica al bot del proyecto. No se disfraza de navegador.
 - Una petición por ciudad por ejecución.
 - Si el sitio responde con un desafío anti-bot, la tarea **falla**. No se intenta evadirlo.
+
+#### Fuente 2: Trivago (BeautifulSoup): descarga en vivo con respaldo de páginas guardadas
+
+> **Resultado real (6 de octubre de 2026):** Trivago respondió **HTTP 403 con desafío anti-bot** a las tres páginas de destino. El flow lo detecta, **no reintenta ni lo evade**, y procesa en su lugar las páginas guardadas desde el navegador: **34** alojamientos en Medellín, **32** en Cartagena y **34** en Santa Marta (`fuente: "trivago-muestra"`). Si algún día Trivago deja pasar al bot, el mismo código toma los datos en vivo (`fuente: "trivago"`) sin cambiar nada.
+
+Se descargan las **páginas de destino** de Trivago (`/es-CO/odr/hoteles-<ciudad>?search=200-<id>`), que su `robots.txt` **permite**: prohíbe `/*/srl/` (resultados de búsqueda), `/hotel/` y las imágenes, pero no `/es-CO/odr/`. Además, estas páginas aparecen en su sitemap de destinos, es decir, Trivago quiere que se indexen.
+
+| Ciudad | Página de destino |
+|---|---|
+| MDE | `/es-CO/odr/hoteles-medellín-colombia?search=200-65524` |
+| CTG | `/es-CO/odr/hoteles-cartagena-colombia?search=200-65529` |
+| SMR | `/es-CO/odr/hoteles-santa-marta-colombia?search=200-65542` |
+
+- **¿Por qué BeautifulSoup y no Selenium?** Estas páginas llegan con los hoteles ya escritos en el HTML del servidor, así que no hace falta ejecutar JavaScript ni abrir un navegador: `httpx` descarga y BeautifulSoup parsea. BeautifulSoup es un parser y no sirve para "esquivar" bloqueos, porque eso depende de la petición HTTP, no del parser.
+- **Selectores estables** (`ingesta/trivago.py`), nunca las clases CSS ofuscadas que Trivago regenera en cada despliegue: (1) microdatos de schema.org (`itemtype=".../Hotel"`, `itemprop="name"`, `price`, `ratingValue`); (2) el enlace de cada hotel `/oar/...?search=100-<id>`: la tarjeta es el contenedor más pequeño que tiene precio sin incluir otro hotel; (3) bloques JSON-LD.
+- Cada hotel puede traer varias ofertas de distintos partners: se guarda la **más barata**. Los precios en formato colombiano (`$ 1.024.473`, el punto separa miles) se normalizan antes de `limpiar`.
+- Usa la misma descarga responsable que Hostelworld (`obtener_html`): `robots.txt` revisado en cada ejecución con `protego`, `User-Agent` honesto, una petición por ciudad.
+- **Si Trivago bloquea al bot** (403, 429 o desafío anti-bot), la tarea falla **sin reintentar** (insistir sería ir contra la voluntad del sitio; un error de red sí se reintenta), y el flow usa como **respaldo** la página de esa ciudad guardada a mano en `ingesta/muestras/trivago/` (`fuente: "trivago-muestra"`). Instrucciones en [`LEEME.md`](ingesta/muestras/trivago/LEEME.md).
+- Probar la descarga en vivo sin tocar la BD: `docker compose exec ingesta python trivago.py --probar`. Si encuentra 0 hoteles, guarda el HTML en `ingesta/muestras/diagnostico-<ciudad>.html` para revisar los selectores.
 
 ### Paso 7 — Ciberseguridad por diseño
 
@@ -259,6 +284,12 @@ Como todo pasa por un único endpoint `/graphql`, el límite se aplica **por ope
 
 Último resultado: **0 vulnerabilidades conocidas en los 6 servicios.**
 
+El frontend se audita con `npm audit` (`seguridad/auditar-frontend.sh` → [`seguridad/auditoria-frontend.md`](seguridad/auditoria-frontend.md)). Último resultado: **0 vulnerabilidades en 39 paquetes.**
+
+```bash
+docker run --rm -v "${PWD}:/w" -w /w node:22-alpine sh seguridad/auditar-frontend.sh
+```
+
 Para volver a ejecutarla (no requiere Python instalado):
 
 ```bash
@@ -266,6 +297,26 @@ docker run --rm -v "${PWD}:/w" -w /w python:3.12-slim sh seguridad/auditar.sh
 ```
 
 > En Windows CMD, reemplaza `${PWD}` por `%cd%`.
+
+### Paso 8 — Frontend
+
+`frontend/` es una SPA en **React 19 + Vite + Tailwind**, compilada y servida por **nginx** (build multi-etapa: la imagen final no lleva Node ni el código fuente).
+
+- **Solo habla con `/graphql`.** nginx reenvía esa ruta al Gateway; el frontend no conoce ningún microservicio.
+- **Sin over-fetching:** cada consulta (`frontend/src/operaciones.js`) pide solo los campos que la pantalla muestra.
+- **Vista de cliente** (`http://localhost:3000`): buscar por destino, noches y **personas (1 a 9)**, crear cuenta o iniciar sesión desde el encabezado, reservar y ver el resultado en lenguaje de cliente (confirmada con código `WS-…`, o no completada porque todo se canceló solo). Sin paneles técnicos.
+- **Modo demo** (`http://localhost:3000/?demo`), para la sustentación: añade el **panel técnico de la SAGA** (pasos y compensaciones en orden inverso), el **Inspector GraphQL** (cada operación con su consulta exacta, bytes y tiempo), los enlaces a Prefect, Dask y GraphiQL y la etiqueta de origen de cada precio ("Hostelworld · en vivo", "Trivago · muestra").
+- **Sesión segura:** el token vive en la cookie `HttpOnly`; JavaScript nunca lo lee ni lo guarda en `localStorage`.
+- **Cabeceras de seguridad** en nginx: CSP solo `'self'` (las fuentes van empaquetadas, sin CDN), `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy`.
+- **Rate limiting por IP real:** nginx envía `X-Real-IP` y el Gateway solo le cree si la petición viene del contenedor `frontend` (`PROXY_CONFIABLE`). Así cada usuario tiene su propio límite y nadie puede falsificar su IP llamando directo al puerto 8000.
+
+Para desarrollar con recarga en caliente (con el resto del stack en Docker):
+
+```bash
+cd frontend
+npm install
+npm run dev     # http://localhost:5173 (Vite reenvía /graphql a localhost:8000)
+```
 
 ---
 
@@ -335,7 +386,7 @@ mutation {
    docker compose up -d autos
    ```
 
-3. Inicia sesión (sección 5) y ejecuta la mutation `reservarPaquete` → debe responder `estado: "COMPENSADA"`.
+3. En **http://localhost:3000/?demo**, inicia sesión y reserva cualquier paquete → el cliente ve "No pudimos completar tu viaje" y el panel *Transacción SAGA* muestra `Compensada`: el auto falló y hotel y vuelo aparecen *Reservado → cancelado*, con las compensaciones en orden inverso. (También se puede hacer desde GraphiQL con la mutation `reservarPaquete` de la sección 5.)
 
 4. Mira el log del orquestador:
 
@@ -431,9 +482,10 @@ Debe responder `{"data":{"yo":null}}`.
 - [x] Simulación de fallo (`FORZAR_FALLO_AUTOS`)
 - [x] API Gateway GraphQL (query `paquetes`, `orden`; mutation `reservarPaquete`)
 - [x] Scraping real (Hostelworld) + Dask workers + Prefect Flow con retries y programación cada 30 min
+- [x] Segunda fuente: Trivago con BeautifulSoup. En vivo responde 403 (anti-bot), así que se usan las páginas guardadas de respaldo (100 alojamientos en las 3 ciudades)
 - [x] Ciberseguridad: Argon2id, regeneración de sesión (Session Fixation), Rate Limiting, auditoría `pip-audit`
-- [ ] Frontend mínimo consumiendo el Gateway
-- [ ] Documento técnico de arquitectura
+- [x] Frontend (React) consumiendo el Gateway, con panel SAGA e inspector GraphQL
+- [x] Documento técnico de arquitectura ([`docs/documento-tecnico.md`](docs/documento-tecnico.md))
 
 ---
 
@@ -448,5 +500,9 @@ Debe responder `{"data":{"yo":null}}`.
 | `Demasiados intentos` (HTTP 429) | Es el rate limiting funcionando. Espera un minuto. |
 | Error con la tabla `usuarios` o la BD `auth` | Se agregó en `init.sql` después de crear tu BD. Ejecuta `docker compose down -v` y vuelve a levantar. |
 | El flow guarda 0 hostales | El sitio pudo cambiar su HTML. Revisa los selectores de `estructurar()` en `ingesta/flow.py`. |
+| Trivago no aparece en el frontend | Ejecuta `docker compose exec ingesta python trivago.py --probar`. Si dice HTTP 403 o anti-bot, Trivago bloqueó al bot: guarda las páginas de respaldo (`ingesta/muestras/trivago/LEEME.md`). Si dice 0 hoteles, Trivago cambió su HTML: revisa `ingesta/muestras/diagnostico-<ciudad>.html`. |
+| Prefect muestra `Can't evaluate bulk DML statement; please supply a bulk_dml decorated function` | SQLAlchemy 2.1 es incompatible con Prefect Server. `ingesta/requirements.txt` fija `sqlalchemy<2.1`; reconstruye con `docker compose build --no-cache prefect-server`. |
+| En Prefect faltan tareas o logs, o sale `database is locked` | Prefect debe usar PostgreSQL (`PREFECT_API_DATABASE_CONNECTION_URL` en `docker-compose.yml`), no SQLite. Si tu BD se creó antes de ese cambio: `docker compose exec db psql -U postgres -c "CREATE DATABASE prefect"` y `docker compose up -d prefect-server`. |
+| `column "personas" of relation "sagas" does not exist` | Tu BD se creó antes de que existiera el número de personas: `docker compose exec db psql -U postgres -d ordenes -c "ALTER TABLE sagas ADD COLUMN IF NOT EXISTS personas INT NOT NULL DEFAULT 1 CHECK (personas BETWEEN 1 AND 9)"` |
 | Comandos de Docker se quedan colgados | Probablemente el disco se llenó. Libera espacio y reinicia Docker Desktop. |
 | La demo del fallo no falla | Verifica que el `.env` esté en la raíz y que reiniciaste Autos (`docker compose up -d autos`). Comprueba con `docker compose exec autos python -c "import os; print(os.environ['FORZAR_FALLO_AUTOS'])"`. |

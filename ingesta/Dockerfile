@@ -7,4 +7,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
+# Los workers de Dask ejecutan tareas que importan módulos propios (trivago.py): deben encontrarlos en /app
+ENV PYTHONPATH=/app
 # Sin CMD: cada servicio del docker-compose.yml define su propio "command".
