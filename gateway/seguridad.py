@@ -62,6 +62,14 @@ DURACION_SEG = 3600   # 1 hora
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
 
 
+def _https(request) -> bool:
+    """¿La cookie debe ser Secure? Sí si se configuró así, o si la petición llegó por HTTPS a través del
+    proxy de confianza (la URL pública del túnel es https aunque nginx y el Gateway hablen http por dentro)."""
+    if COOKIE_SECURE:
+        return True
+    return request.headers.get("x-forwarded-proto") == "https" and ip_confiable(request)
+
+
 def _sha256(token: str) -> str:
     # En la BD se guarda el hash del token, no el token: si roban la BD, no pueden usar las sesiones
     return hashlib.sha256(token.encode()).hexdigest()
@@ -87,7 +95,7 @@ async def crear_sesion(info, usuario_id: int) -> None:
         max_age=DURACION_SEG,
         httponly=True,       # JavaScript no puede leerla -> un XSS no puede robar la sesión
         samesite="strict",   # no se envía desde otros sitios -> protege contra CSRF
-        secure=COOKIE_SECURE,
+        secure=_https(request),
     )
 
 
@@ -152,12 +160,16 @@ def _ips_proxy() -> set[str]:
     return _cache_proxy[1]
 
 
+def ip_confiable(request) -> bool:
+    """¿La petición viene del proxy de confianza (el contenedor frontend)?"""
+    return bool(PROXY_CONFIABLE) and request.client.host in _ips_proxy()
+
+
 def ip_cliente(info) -> str:
     request = info.context["request"]
-    ip = request.client.host
-    if PROXY_CONFIABLE and ip in _ips_proxy():
-        return request.headers.get("x-real-ip", ip)
-    return ip
+    if ip_confiable(request):
+        return request.headers.get("x-real-ip", request.client.host)
+    return request.client.host
 
 
 def limitar(info, regla: str, *claves: str) -> None:

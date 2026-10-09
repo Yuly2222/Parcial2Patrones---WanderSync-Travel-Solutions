@@ -1,15 +1,35 @@
 import os                       # Para leer variables de entorno (la URL de la BD)
+from contextlib import asynccontextmanager
 from uuid import UUID           # Tipo para los identificadores de SAGA
 import psycopg                  # Driver de PostgreSQL para Python
-from fastapi import FastAPI     # Framework web
+from fastapi import FastAPI, HTTPException     # Framework web
 from pydantic import BaseModel  # Valida automáticamente el JSON que nos envían
-
-# "app" es el servidor web. El Dockerfile la arranca con: uvicorn main:app
-app = FastAPI()
 
 # La URL de la BD NO se escribe en el código: viene del docker-compose.yml (variable DATABASE_URL).
 # Así las credenciales quedan fuera del código (seguridad por diseño).
 DB = os.environ["DATABASE_URL"]
+
+# MIGRACIÓN al arrancar. db/init.sql solo corre la primera vez que se crea el volumen de Postgres; estas
+# sentencias son idempotentes (IF NOT EXISTS), así que actualizan una BD ya creada sin borrar nada.
+# fuente + índice único: la ingesta (Prefect) carga los vuelos de Booking con UPSERT por ruta y fuente.
+MIGRACION = """
+ALTER TABLE vuelos ADD COLUMN IF NOT EXISTS fuente TEXT NOT NULL DEFAULT 'semilla';
+ALTER TABLE vuelos ADD COLUMN IF NOT EXISTS actualizado TIMESTAMPTZ NOT NULL DEFAULT now();
+CREATE UNIQUE INDEX IF NOT EXISTS vuelos_ruta_fuente ON vuelos (origen, destino, fuente);
+ALTER TABLE vuelos ADD COLUMN IF NOT EXISTS destino_nombre TEXT;   -- "Ciudad de México" (de la página de Booking)
+ALTER TABLE vuelos ADD COLUMN IF NOT EXISTS pais TEXT;             -- "México"
+"""
+
+
+@asynccontextmanager
+async def ciclo_de_vida(app):
+    with psycopg.connect(DB) as conn:
+        conn.execute(MIGRACION)
+    yield
+
+
+# "app" es el servidor web. El Dockerfile la arranca con: uvicorn main:app
+app = FastAPI(lifespan=ciclo_de_vida)
 
 
 # Cuando alguien haga GET a /health, se ejecuta esta función.
@@ -38,11 +58,34 @@ def listar_vuelos(destino: str | None = None):
     with psycopg.connect(DB) as conn:
         # Si destino es NULL (no lo enviaron) la condición es verdadera para todas las filas -> lista todo
         filas = conn.execute(
-            "SELECT id, origen, destino, precio FROM vuelos WHERE %s::text IS NULL OR destino = %s",
+            "SELECT id, origen, destino, precio, fuente FROM vuelos WHERE %s::text IS NULL OR destino = %s "
+            "ORDER BY precio",
             (destino, destino),
         ).fetchall()
-    # f[0], f[1], f[2], f[3] siguen el MISMO orden de las columnas del SELECT
-    return [{"id": f[0], "origen": f[1], "destino": f[2], "precio": f[3]} for f in filas]
+    # f[0], f[1], f[2]... siguen el MISMO orden de las columnas del SELECT
+    return [{"id": f[0], "origen": f[1], "destino": f[2], "precio": f[3], "fuente": f[4]} for f in filas]
+
+
+# Un vuelo por id: el Gateway lo usa al reservar para calcular el precio en el servidor
+# (nunca se confía en un precio que mande el navegador).
+@app.get("/vuelos/{vuelo_id}")
+def ver_vuelo(vuelo_id: int):
+    with psycopg.connect(DB) as conn:
+        f = conn.execute("SELECT id, origen, destino, precio, fuente FROM vuelos WHERE id = %s", (vuelo_id,)).fetchone()
+    if f is None:
+        raise HTTPException(status_code=404, detail="Vuelo no encontrado")
+    return {"id": f[0], "origen": f[1], "destino": f[2], "precio": f[3], "fuente": f[4]}
+
+
+# Ciudades a las que hay al menos un vuelo, con su nombre y país (el Gateway las cruza con las ciudades que
+# tienen hoteles). max() toma el nombre de la fila que lo tenga (los vuelos semilla no traen nombre).
+@app.get("/destinos")
+def listar_destinos():
+    with psycopg.connect(DB) as conn:
+        filas = conn.execute(
+            "SELECT destino, max(destino_nombre), max(pais), min(precio) FROM vuelos GROUP BY destino ORDER BY destino"
+        ).fetchall()
+    return [{"codigo": f[0], "nombre": f[1], "pais": f[2], "vuelo_desde": f[3]} for f in filas]
 
 
 # ---------------- Endpoints que usa la SAGA ----------------

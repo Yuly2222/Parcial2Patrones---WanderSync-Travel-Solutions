@@ -41,6 +41,15 @@ services:
     depends_on:
       db: { condition: service_healthy }
 
+  # Microservicio de Ofertas: ofertas de Booking por categoría (las escribe la ingesta, este servicio las sirve).
+  # Al arrancar crea su BD y su tabla si no existen.
+  ofertas:
+    build: ./ofertas
+    environment:
+      DATABASE_URL: postgresql://postgres:dev@db:5432/ofertas
+    depends_on:
+      db: { condition: service_healthy }
+
   # Microservicio de Órdenes = orquestador de la SAGA
   ordenes:
     build: ./ordenes
@@ -67,6 +76,7 @@ services:
       hoteles: { condition: service_started }
       autos: { condition: service_started }
       ordenes: { condition: service_started }
+      ofertas: { condition: service_started }
     ports:
       - "8000:8000"                    # "puerto_de_tu_PC:puerto_del_contenedor"
 
@@ -79,6 +89,18 @@ services:
       gateway: { condition: service_started }
     ports:
       - "3000:80"
+
+  # URL PÚBLICA con Cloudflare Tunnel (gratis, sin cuenta). Solo arranca con el perfil "publico":
+  #   docker compose --profile publico up -d
+  #   docker compose logs tunel        -> busca la línea https://<algo>.trycloudflare.com
+  # El túnel sale desde tu PC hacia Cloudflare (no abre puertos en tu router) y SOLO expone el frontend:
+  # Prefect, Dask, la BD y los microservicios siguen siendo privados. La URL cambia cada vez que se reinicia.
+  tunel:
+    image: cloudflare/cloudflared:latest
+    profiles: ["publico"]
+    command: tunnel --no-autoupdate --url ${TUNEL_DESTINO:-http://frontend:80}
+    depends_on:
+      frontend: { condition: service_started }
 
   # ===================== INGESTA: Prefect + Dask + scraper =====================
   # Los 4 servicios usan la misma imagen (carpeta ingesta/) con distinto "command".
@@ -118,6 +140,9 @@ services:
       replicas: 2                      # 2 contenedores worker -> computación distribuida real
     environment:
       DATABASE_URL: postgresql://postgres:dev@db:5432/hoteles   # la tarea "guardar" corre aquí
+      OFERTAS_DATABASE_URL: postgresql://postgres:dev@db:5432/ofertas   # la tarea "guardar_ofertas" corre aquí
+      VUELOS_DATABASE_URL: postgresql://postgres:dev@db:5432/vuelos     # "guardar_catalogo": vuelos de Booking
+      AUTOS_DATABASE_URL: postgresql://postgres:dev@db:5432/autos       # "guardar_catalogo": autos de Booking
       PREFECT_API_URL: http://prefect-server:4200/api           # las tareas reportan su estado a Prefect
       PROB_FALLO_SCRAPER: ${PROB_FALLO_SCRAPER:-0}              # demo de retries (ver README)
     depends_on:
@@ -135,6 +160,9 @@ services:
       DATABASE_URL: postgresql://postgres:dev@db:5432/hoteles
       PREFECT_API_URL: http://prefect-server:4200/api
       DASK_SCHEDULER: tcp://dask-scheduler:8786
+      OFERTAS_DATABASE_URL: postgresql://postgres:dev@db:5432/ofertas
+      VUELOS_DATABASE_URL: postgresql://postgres:dev@db:5432/vuelos
+      AUTOS_DATABASE_URL: postgresql://postgres:dev@db:5432/autos
     depends_on:
       prefect-server: { condition: service_healthy }   # sin servidor de Prefect el flow no puede registrarse
       dask-worker: { condition: service_started }

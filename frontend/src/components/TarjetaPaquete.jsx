@@ -1,4 +1,5 @@
-// Una combinación vuelo + hotel + auto, con el desglose del precio y el botón de reserva.
+// Una combinación vuelo + hotel + auto (o vuelo + hotel donde no hay alquiler de autos),
+// con el desglose del precio y el botón de reserva.
 import { DEMO, pesos, plural, nombreCiudad } from "../formato";
 
 // De dónde viene el precio del hotel (columna "fuente" de la BD de hoteles).
@@ -25,9 +26,9 @@ const FUENTES = {
   semilla: { cliente: null, demo: "Dato semilla", clase: "bg-niebla/60 text-acero", ayuda: "Dato de prueba de db/init.sql" },
 };
 
-function Tramo({ etiqueta, titulo, detalle, children }) {
+function Tramo({ etiqueta, titulo, detalle, children, className = "" }) {
   return (
-    <div className="min-w-0">
+    <div className={`min-w-0 ${className}`}>
       <p className="text-[11px] font-semibold tracking-wider text-piedra uppercase">{etiqueta}</p>
       <p className="mt-0.5 truncate font-semibold text-tinta" title={typeof titulo === "string" ? titulo : undefined}>
         {titulo}
@@ -45,7 +46,8 @@ export default function TarjetaPaquete({ paquete, noches, personas, onReservar, 
 
   return (
     <article className="entrar grid gap-4 rounded-2xl border border-niebla bg-white p-4 sm:grid-cols-[1fr_auto] sm:p-5">
-      <div className="grid gap-4 sm:grid-cols-3">
+      {/* Celular: el hotel a lo ancho y debajo vuelo y auto lado a lado. Desde 640 px: las tres columnas */}
+      <div className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3 sm:gap-4">
         <Tramo
           etiqueta="Vuelo"
           titulo={
@@ -54,9 +56,16 @@ export default function TarjetaPaquete({ paquete, noches, personas, onReservar, 
             </span>
           }
           detalle={personas > 1 ? `${pesos(vuelo.precio)} × ${personas} personas` : pesos(vuelo.precio)}
-        />
+        >
+          {vuelo.fuente === "booking-muestra" && (
+            <span className="mt-1.5 inline-block rounded bg-[#2e5e8c]/10 px-1.5 py-0.5 text-xs font-medium text-[#2e5e8c]">
+              {DEMO ? "Booking · página guardada" : "Precio de Booking"}
+            </span>
+          )}
+        </Tramo>
         <Tramo
           etiqueta="Hotel"
+          className="order-first col-span-2 sm:order-none sm:col-span-1"
           titulo={hotel.nombre}
           detalle={`${pesos(hotel.precioNoche)} / noche${habitaciones > 1 ? ` × ${habitaciones} hab.` : ""}`}
         >
@@ -73,11 +82,16 @@ export default function TarjetaPaquete({ paquete, noches, personas, onReservar, 
             )}
           </div>
         </Tramo>
-        <Tramo
-          etiqueta="Auto"
-          titulo={auto.modelo}
-          detalle={`${pesos(auto.precioDia)} / día${autos > 1 ? ` × ${autos} autos` : ""}`}
-        />
+        {auto ? (
+          <Tramo
+            etiqueta="Auto"
+            titulo={auto.modelo}
+            detalle={`${pesos(auto.precioDia)} / día${autos > 1 ? ` × ${autos} autos` : ""}`}
+          />
+        ) : (
+          // San Andrés, Pereira...: Booking no tiene alquiler de autos ahí, el paquete es vuelo + hotel
+          <Tramo etiqueta="Auto" titulo={<span className="text-piedra">Sin auto</span>} detalle="No hay alquiler en este destino" />
+        )}
       </div>
 
       <div className="flex items-end justify-between gap-4 border-t border-niebla pt-4 sm:flex-col sm:items-end sm:border-t-0 sm:border-l sm:pt-0 sm:pl-5">

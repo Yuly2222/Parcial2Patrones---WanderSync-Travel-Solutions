@@ -74,7 +74,7 @@ Objetivos de diseño que se derivan:
 | SAGA con happy path y compensaciones automáticas | Orquestador con compensación en orden inverso, reintentos e idempotencia | `ordenes/main.py`, §6 |
 | Fallo simulado | Interruptor `FORZAR_FALLO_AUTOS=true` (Autos responde 503) | `autos/main.py` |
 | Dask para recolección e ingesta | Scheduler + 2 workers; `DaskTaskRunner` reparte las tareas | `ingesta/flow.py`, §8 |
-| Fuentes reales (Google Flights, Kayak, Booking...) | Hostelworld en vivo y Trivago con BeautifulSoup; Trivago bloquea al bot (403), así que se usan sus páginas guardadas de respaldo | `ingesta/flow.py`, `ingesta/trivago.py`, §8.4–8.5 |
+| Fuentes reales (Google Flights, Kayak, Booking...) | Hostelworld en vivo; Trivago con BeautifulSoup (bloquea al bot, se usan páginas guardadas de respaldo); ofertas de Booking por categoría desde páginas guardadas | `ingesta/flow.py`, `ingesta/trivago.py`, §8.4–8.5 |
 | Prefect con retries y monitoreo | Flow `ingesta-hoteles`, retries 5 s/15 s/45 s, panel en `:4200` | `ingesta/flow.py`, §8 |
 | Persistencia con integración GraphQL | PostgreSQL expuesto mediante el Gateway GraphQL (justificación en §5.6) | `db/init.sql`, §5.6 |
 | Session Fixation | Se destruye la sesión previa y se emite un ID nuevo en cada login | `gateway/seguridad.py`, §9.2 |
@@ -99,6 +99,7 @@ flowchart LR
         GW -->|GET en paralelo| H[Hoteles]
         GW -->|GET en paralelo| A[Autos]
         GW -->|POST /ordenes| O["Órdenes<br/>orquestador SAGA"]
+        GW -->|GET /ofertas| OF[Ofertas]
         O -->|reservar / cancelar| V
         O -->|reservar / cancelar| H
         O -->|reservar / cancelar| A
@@ -109,18 +110,21 @@ flowchart LR
             DA[(autos)]
             DO[(ordenes)]
             DU[(auth)]
+            DOF[(ofertas)]
         end
         V --- DV
         H --- DH
         A --- DA
         O --- DO
         GW --- DU
+        OF --- DOF
 
         PF["Prefect Flow<br/>ingesta-hoteles"] -->|DaskTaskRunner| DS[Dask scheduler]
         DS --> W1[Dask worker 1]
         DS --> W2[Dask worker 2]
         W1 -->|UPSERT en lote| DH
         W2 -->|UPSERT en lote| DH
+        W1 -->|UPSERT ofertas| DOF
         PS["Prefect server<br/>panel :4200"]
         PF -. estado y logs .-> PS
         W1 -. estado de tareas .-> PS
@@ -225,6 +229,8 @@ Vuelos, Hoteles, Autos y Órdenes no publican puertos: solo son accesibles dentr
 | 2 | Hoteles | Inserta reserva `CONFIRMADA` | Estado → `CANCELADA` |
 | 3 | Autos | Inserta reserva `CONFIRMADA` (o 503 si `FORZAR_FALLO_AUTOS`) | Estado → `CANCELADA` |
 
+El paso 3 solo existe si el paquete trae auto: donde Booking no tiene alquiler de autos (Pereira, San Andrés, Cancún, Lima…) y el paquete es vuelo + hotel (`auto_id` nulo), así que la SAGA tiene dos pasos.
+
 Reglas del orquestador (`ordenes/main.py`):
 
 1. Registra la SAGA en la tabla `sagas` con estado `EN_CURSO` **antes** de empezar.
@@ -233,6 +239,9 @@ Reglas del orquestador (`ordenes/main.py`):
 4. Ante un fallo, compensa en **orden inverso** (lo último primero).
 5. Cada compensación se reintenta con **backoff exponencial** (1 s, 2 s, 4 s, 8 s, 16 s): una compensación no puede rendirse.
 6. Si una compensación agota sus reintentos, la SAGA queda en `REQUIERE_ATENCION`: nunca falla en silencio.
+7. Cada SAGA guarda su dueño (`usuario_id`) y un resumen de lo reservado (destino, vuelo, hotel, auto, noches, personas y total). Lo envía el Gateway, porque Órdenes no puede leer las bases de datos de los otros servicios.
+
+**Cancelación por el cliente.** `POST /ordenes/{id}/cancelar` reutiliza las mismas compensaciones: primero cambia el estado de `CONFIRMADA` a `CANCELANDO` con un único `UPDATE … WHERE estado = 'CONFIRMADA' AND usuario_id = …` (transición atómica: si llegan dos cancelaciones a la vez, solo una la encuentra en `CONFIRMADA` y la otra recibe 409), y después cancela auto → hotel → vuelo con los mismos reintentos e idempotencia. Termina en `CANCELADA`, o en `REQUIERE_ATENCION` si alguna cancelación no se logró.
 
 ### 6.2 Máquina de estados
 
@@ -244,7 +253,11 @@ stateDiagram-v2
     EN_CURSO --> COMPENSANDO: un paso falla
     COMPENSANDO --> COMPENSADA: todas las cancelaciones OK
     COMPENSANDO --> REQUIERE_ATENCION: alguna cancelación agota sus reintentos
+    CONFIRMADA --> CANCELANDO: el cliente cancela
+    CANCELANDO --> CANCELADA: auto, hotel y vuelo liberados
+    CANCELANDO --> REQUIERE_ATENCION: alguna cancelación agota sus reintentos
     CONFIRMADA --> [*]
+    CANCELADA --> [*]
     COMPENSADA --> [*]
     REQUIERE_ATENCION --> [*]: intervención manual
 ```
@@ -365,8 +378,14 @@ Estado en la BD de hoteles tras una reserva exitosa y una compensada:
 type Query {
   "Paquetes disponibles (vuelo + hotel + auto) hacia una ciudad destino"
   paquetes(destino: String!, noches: Int! = 1, personas: Int! = 1): [Paquete!]!   # personas: 1 a 9
-  "Estado de una reserva (SAGA) por su id"
+  "Ciudades con paquetes hoy: tienen vuelo Y alojamiento"
+  destinos: [String!]!
+  "Estado y resumen de una reserva propia (requiere sesión; la de otro usuario devuelve null)"
   orden(sagaId: String!): Orden
+  "Reservas del usuario de la sesión, la más reciente primero (requiere sesión)"
+  misReservas: [Orden!]!
+  "Ofertas de Booking por categoría (alojamiento, vuelos, coches, atracciones)"
+  ofertas(categoria: String): [Oferta!]!
   "Usuario de la sesión actual (null si no hay sesión)"
   yo: Usuario
 }
@@ -375,14 +394,18 @@ type Mutation {
   registrar(email: String!, password: String!): Usuario!
   iniciarSesion(email: String!, password: String!): Usuario!   # emite una sesión NUEVA
   cerrarSesion: Boolean!
-  reservarPaquete(vueloId: Int!, hotelId: Int!, autoId: Int!, personas: Int! = 1): Orden!  # requiere sesión; dispara la SAGA
+  # requiere sesión; el Gateway valida el paquete y calcula el total (el cliente no manda precios)
+  reservarPaquete(vueloId: Int!, hotelId: Int!, autoId: Int, personas: Int! = 1, noches: Int! = 1): Orden!
+  cancelarReserva(sagaId: String!): Orden!   # requiere sesión; solo reservas propias en estado CONFIRMADA
 }
 
-type Paquete { vuelo: Vuelo!  hotel: Hotel!  auto: Auto!  personas: Int!  habitaciones: Int!  autos: Int!  precioTotal: Float! }
-type Vuelo   { id: Int!  origen: String!  destino: String!  precio: Float! }
+type Paquete { vuelo: Vuelo!  hotel: Hotel!  auto: Auto  personas: Int!  habitaciones: Int!  autos: Int!  precioTotal: Float! }   # auto null = vuelo + hotel
+type Vuelo   { id: Int!  origen: String!  destino: String!  precio: Float!  fuente: String! }
 type Hotel   { id: Int!  nombre: String!  ciudad: String!  precioNoche: Float!  rating: Float  fuente: String! }
-type Auto    { id: Int!  modelo: String!  ciudad: String!  precioDia: Float! }
-type Orden   { sagaId: String!  estado: String!  paso: String  personas: Int }
+type Auto    { id: Int!  modelo: String!  ciudad: String!  precioDia: Float!  fuente: String! }
+type Orden   { sagaId: String!  estado: String!  paso: String  personas: Int  noches: Int  destino: String
+               vuelo: String  hotel: String  auto: String  total: Float  creado: String }
+type Oferta  { categoria: String!  destino: String!  titulo: String  detalle: String  ciudad: String  cantidad: Int  precioDesde: Float!  unidad: String  campana: String  url: String  fuente: String! }
 type Usuario { id: Int!  email: String! }
 ```
 
@@ -406,7 +429,22 @@ Ejemplo de consulta mínima y respuesta:
 
 `precioTotal = vuelo.precio × personas + (hotel.precioNoche × habitaciones + auto.precioDia × autos) × noches`
 
-con `habitaciones = ⌈personas / 2⌉` (hasta 2 personas por habitación) y `autos = ⌈personas / 5⌉` (hasta 5 por vehículo). El Gateway valida 1 a 9 personas y 1 a 30 noches; el servicio Órdenes vuelve a validar el rango (Pydantic) y guarda `personas` en la tabla `sagas`.
+con `habitaciones = ⌈personas / 2⌉` (hasta 2 personas por habitación) y `autos = ⌈personas / 5⌉` (hasta 5 por vehículo; 0 si el paquete no trae auto). El Gateway valida 1 a 9 personas y 1 a 30 noches; el servicio Órdenes vuelve a validar el rango (Pydantic).
+
+La misma función calcula el precio al **listar** y al **reservar**. Al reservar, el navegador solo envía ids, personas y noches: el Gateway pide vuelo, hotel y auto por id a cada servicio (en paralelo), comprueba que sean del mismo destino y calcula el total, que queda guardado en la SAGA. Modificar la petición no cambia lo que se cobra.
+
+### 7.4 Destinos
+
+| Código | Ciudad | Alojamiento | Vuelo BOG → | Auto |
+|---|---|---|---|---|
+| MDE · CTG · SMR | Medellín, Cartagena, Santa Marta | Hostelworld + Trivago | Booking + semilla | Booking + semilla |
+| CLO · BAQ · BGA | Cali, Barranquilla, Bucaramanga | Hostelworld | Booking | Booking (precio medio por día) |
+| PEI · ADZ | Pereira, San Andrés | Hostelworld | Booking | — (paquete vuelo + hotel) |
+| MAD | Madrid | Hostelworld | Booking | Booking |
+
+**Ampliación a 50 vuelos.** La página "Vuelos desde Bogotá" pinta 10 tarjetas, pero su estado inicial (`window.__INITIAL_STATE__.flyAnywhere.results`) trae **50 destinos** con código IATA, país y precio por persona; el parser lee ese JSON. Todos pasan al catálogo de Vuelos. El flow descarga Hostelworld para **30** de ellos (14 en Colombia, 10 en América y 6 en Europa: Lima, Quito, Buenos Aires, Panamá, Ciudad de México, Cancún, Miami, Nueva York, Orlando, Los Ángeles, Madrid, Barcelona, París, Roma, Londres y Ámsterdam), así que hasta 30 destinos tienen paquete. La tabla anterior resume los 9 primeros.
+
+La query `destinos` cruza los destinos con vuelo (`GET /destinos` de Vuelos, con nombre y país) y las ciudades con alojamiento (`GET /ciudades` de Hoteles): solo esos tienen paquete. Los demás (Cúcuta, Montería, Valledupar, Caracas, Fráncfort…) aparecen en el selector de destino con sus ofertas de Booking.
 
 ---
 
@@ -423,7 +461,7 @@ con `habitaciones = ⌈personas / 2⌉` (hasta 2 personas por habitación) y `au
 ```mermaid
 flowchart LR
     S(["Programación<br/>cada 30 min · o Quick run"]) --> F["Flow ingesta-hoteles"]
-    F -->|".map(MDE, CTG, SMR)"| D1
+    F -->|".map(30 ciudades)"| D1
     subgraph ciudad["Por cada ciudad (en paralelo en los workers de Dask)"]
         D1["descargar<br/>robots.txt + HTTPS<br/>retries 3: 5 s · 15 s · 45 s"] --> E1["estructurar<br/>BeautifulSoup"]
         E1 --> L1["limpiar<br/>texto → Decimal<br/>descarta inválidos"]
@@ -437,7 +475,7 @@ flowchart LR
     G1 --> R["Resumen<br/>total de alojamientos"]
 ```
 
-Son **12 tareas por ejecución** (4 × 3 ciudades). Las tareas se encadenan con *futures*: `estructurar(MDE)` empieza apenas termina `descargar(MDE)`, sin esperar a las otras ciudades. Una ciudad que falla definitivamente no tumba a las demás; el flow solo queda `Failed` si no se pudo ingerir ninguna.
+Son **120 tareas de Hostelworld** (4 × 30 ciudades) más las de Trivago (4 × 3 ciudades) y las de Booking (estructurar, limpiar y guardar por categoría, más `guardar_catalogo` para vuelos y coches). Las tareas se encadenan con *futures*: `estructurar(MDE)` empieza apenas termina `descargar(MDE)`, sin esperar a las otras ciudades. Una ciudad que falla definitivamente no tumba a las demás; el flow solo queda `Failed` si no se pudo ingerir ninguna.
 
 ### 8.3 Política de reintentos
 
@@ -483,6 +521,22 @@ Trivago se descarga en vivo desde sus **páginas de destino** (`/es-CO/odr/hotel
 | HTML cambiado | Si una página llega sin hoteles reconocibles, `estructurar_trivago` falla y se ve en Prefect; `trivago.py --probar` guarda el HTML para revisar |
 
 El flow queda con dos cadenas de 4 tareas por ciudad (Hostelworld y Trivago) corriendo en paralelo en los workers de Dask, más la rama de respaldo.
+
+### 8.5b Tercera fuente: ofertas de Booking.com
+
+Booking responde con un desafío anti-bot (AWS WAF, HTTP 202) incluso a su `robots.txt`; por RFC 9309 eso equivale a no tener permiso, así que no hay descarga automática. Las páginas de ofertas se guardan desde el navegador y el pipeline las procesa.
+
+| Aspecto | Decisión |
+|---|---|
+| Categorías | alojamiento (11 destinos), vuelos (50 destinos desde Bogotá), coches (197 ciudades) y atracciones (1), en `muestras/booking/booking-<categoria>.html` |
+| Selectores | Un parser por pestaña, nunca clases CSS: alojamiento `data-testid="card-deal"`; vuelos el estado inicial embebido (`window.__INITIAL_STATE__.flyAnywhere`, 50 destinos con IATA) y, si falta, las tarjetas `role="button"` *FlyAnywhere*; coches `data-testid="in-product-interlinking-item"`; atracciones el JSON de Apollo embebido (`AttractionsProduct`) |
+| Llave del UPSERT | `(categoria, llave)`: `dest_id` (alojamiento), destino normalizado (vuelos), ruta del enlace (coches), slug (atracciones) |
+| Campos | destino, ciudad del sistema (código IATA), título ("Bogotá → Medellín", nombre de la atracción), detalle (país, puntos de alquiler), cantidad, precio desde y unidad |
+| Enlace | Se guardan solo `dest_id`, `dest_type`, `checkin` y `checkout`; se descartan `aid`, `label` y otros parámetros de rastreo |
+| Tareas | `estructurar_booking` → `limpiar_ofertas` → `guardar_ofertas`, una cadena por categoría en Dask; independientes de los hoteles y sin tumbar el flow si fallan |
+| Persistencia | Nuevo **microservicio Ofertas** con su BD `ofertas` (database per service); crea su BD y su tabla al arrancar si no existen |
+| Catálogo | `guardar_catalogo`: los vuelos desde Bogotá y el precio medio de autos de las ciudades del sistema pasan a las BD de Vuelos y Autos (`fuente = 'booking-muestra'`), con UPSERT por `(origen, destino, fuente)` y `(ciudad, modelo)`. Las ofertas no son solo vitrina: alimentan paquetes reservables |
+| Exposición | Gateway: `ofertas(categoria: String): [Oferta!]!`; frontend: sección con pestañas; las ofertas de ciudades con paquetes enlazan a esos paquetes y las demás a Booking |
 
 ### 8.6 Cómo se evita el cuello de botella en la persistencia
 
@@ -542,8 +596,17 @@ Como todo pasa por un único endpoint `/graphql`, el límite se aplica **por ope
 | `iniciarSesion` | 5/min por IP **y** 10 cada 15 min por email | Fuerza bruta: un atacante probando muchas cuentas, o muchas IPs atacando una cuenta |
 | `registrar` | 3/min por IP | Creación masiva de cuentas |
 | `reservarPaquete` (checkout/pago) | 10/min por IP | Abuso y denegación de servicio del checkout |
+| `cancelarReserva` | 10/min por IP | Abuso de la cancelación |
 
 **IP real detrás del proxy.** Con nginx delante, todas las peticiones llegarían al Gateway desde la IP de nginx y todos los usuarios compartirían un límite (uno solo podría bloquear a los demás). nginx envía `X-Real-IP`, pero esa cabecera la puede escribir cualquiera, así que el Gateway **solo le cree si la petición viene del contenedor `frontend`** (variable `PROXY_CONFIABLE`, resuelta por el DNS interno de Docker). Una petición directa al puerto 8000 con una `X-Real-IP` falsificada se ignora.
+
+### 9.3b Control de acceso a las reservas (IDOR)
+
+Un `sagaId` es un UUID difícil de adivinar, pero no es un secreto: se muestra en la interfaz y queda en los logs. Si bastara con conocerlo para consultar o cancelar una reserva, sería una vulnerabilidad **IDOR** (*Insecure Direct Object Reference*, OWASP A01 *Broken Access Control*). Por eso:
+
+- `orden`, `misReservas` y `cancelarReserva` **exigen sesión**, y el `usuario_id` lo toma el Gateway de la sesión, nunca de la petición.
+- Órdenes filtra **siempre** por ese `usuario_id`. La reserva de otra persona responde igual que una inexistente (`null` / "Reserva no encontrada"): ni siquiera se confirma que existe.
+- El total lo calcula el servidor con los precios de cada servicio (7.3): el cliente no puede alterar lo que se cobra.
 
 ### 9.4 Endurecimiento del frontend
 
@@ -574,11 +637,12 @@ SPA en **React 19 + Vite + Tailwind CSS 4**, compilada a archivos estáticos y s
 
 | Elemento | Vista | Qué hace | Requisito que evidencia |
 |---|---|---|---|
-| Buscador | Cliente | Destino (MDE, CTG, SMR), noches y **personas (1 a 9)** → `query paquetes` | Consumo de GraphQL desde el frontend |
+| Buscador | Cliente | **"Selecciona tu destino"**: todos los destinos de la página (con paquete y solo con ofertas de Booking), con buscador por ciudad o país. **"Búsqueda por paquetes"**: un botón por destino con paquete (`query destinos`). Noches y **personas (1 a 9)** → `query paquetes`, o las ofertas de Booking del destino si no tiene paquete | Consumo de GraphQL desde el frontend |
+| Responsive | Cliente | Probado en 360, 390, 768, 1024 y 1366 px sin desplazamiento horizontal: carrusel de ofertas y fila deslizable de destinos en celular, selector a pantalla completa, tarjeta de paquete reorganizada, desplazamiento a los resultados al buscar | Usabilidad en cualquier dispositivo |
 | Tarjetas de paquete | Cliente | Vuelo × personas, hotel × habitaciones, auto × autos, total y precio por persona; proveedor del precio (Hostelworld o Trivago) | Datos reales ingeridos por Dask/Prefect |
-| Crear cuenta / Iniciar sesión | Cliente | Botones en el encabezado; si alguien reserva sin sesión, se le pide crear cuenta y la reserva se retoma sola | Argon2id, sesiones, rate limiting |
+| Pantalla de acceso | Cliente | Lo primero que se ve sin sesión: iniciar sesión o crear cuenta (validación en vivo, confirmación de contraseña). Nada de la app se muestra antes de entrar | Argon2id, sesiones, rate limiting |
 | Tu reserva | Cliente | Resultado en lenguaje de cliente: confirmada (con código `WS-…` y resumen), no completada (todo se canceló solo) o en revisión | Resultado de la SAGA |
-| Mis reservas | Cliente | Reconsulta el estado con `query orden(sagaId)` | Bitácora de la SAGA |
+| Mis reservas | Cliente | Reservas del usuario guardadas en el servidor (`query misReservas`): destino, hotel, noches, personas, total y estado. **Actualizar estado** (`query orden`) y **Cancelar reserva** con confirmación (`mutation cancelarReserva`) | Bitácora de la SAGA, compensación y control de acceso |
 | Panel *Transacción SAGA* | Demo | Pasos vuelo → hotel → auto y compensaciones en orden inverso | Demostración de la SAGA |
 | Inspector GraphQL | Demo | Cada operación enviada: consulta exacta, HTTP, bytes y tiempo | Sin over-fetching; un único endpoint |
 | Enlaces a Prefect, Dask y GraphiQL | Demo | Accesos directos | Observabilidad |
@@ -610,11 +674,23 @@ Detalles relevantes: `depends_on` con `condition: service_healthy` evita que los
 
 ---
 
+### 11.1 URL pública (Cloudflare Tunnel)
+
+Para la sustentación la app se publica con **Cloudflare Tunnel** (`docker compose --profile publico up -d`): el contenedor `tunel` abre una conexión saliente hacia Cloudflare y recibe una URL `https://….trycloudflare.com`. No se abren puertos en el router ni se crean cuentas.
+
+| Aspecto | Decisión |
+|---|---|
+| Qué se publica | Solo el frontend (nginx). Prefect, Dask, la BD y los microservicios siguen en la red interna |
+| HTTPS | Lo termina Cloudflare; nginx y el Gateway hablan HTTP dentro de Docker |
+| IP real del visitante | nginx toma `CF-Connecting-IP` solo de IPs privadas (el contenedor del túnel) y la pasa como `X-Real-IP`; el Gateway solo le cree a esa cabecera si viene del contenedor `frontend` |
+| Cookie de sesión | El Gateway la marca `Secure` cuando `X-Forwarded-Proto: https` llega desde el proxy de confianza |
+| Limitación | La URL existe mientras el PC y Docker estén encendidos y cambia en cada reinicio. Un despliegue permanente iría en una VM (por ejemplo EC2) con dominio propio |
+
 ## 12. Guion de la demostración
 
 | Punto exigido | Pasos |
 |---|---|
-| **(a) Prefect monitoreando los flows** | `http://localhost:4200` → *Deployments* → `ingesta-hoteles / hostelworld-cada-30-min` → *Quick run*. Mostrar las 12 tareas, sus estados, duración y logs (`MDE: N hostales guardados…`). Con `PROB_FALLO_SCRAPER=0.5` se ven los reintentos. |
+| **(a) Prefect monitoreando los flows** | `http://localhost:4200` → *Deployments* → `ingesta-hoteles / hostelworld-cada-30-min` → *Quick run*. Mostrar las tareas (4 por destino), sus estados, duración y logs (`MDE: N hostales guardados…`). Con `PROB_FALLO_SCRAPER=0.5` se ven los reintentos. |
 | **(b) Tareas distribuidas en Dask** | Durante el *Quick run*, abrir `http://localhost:8787`: las tareas se reparten entre los 2 workers (*Task Stream*, *Workers*). |
 | **(c) Consumo de GraphQL desde el frontend** | `http://localhost:3000/?demo`: buscar Medellín para 4 personas, mostrar las tarjetas ("Hostelworld · en vivo", "Trivago · muestra") y abrir el **Inspector GraphQL** para ver la consulta exacta y el tamaño de la respuesta. Mostrar también `http://localhost:3000` (vista de cliente, sin paneles técnicos). |
 | **(d) Fallo transaccional y compensaciones** | Crear `.env` con `FORZAR_FALLO_AUTOS=true` → `docker compose up -d autos` → reservar desde `http://localhost:3000/?demo` → el cliente ve "No pudimos completar tu viaje" y el panel técnico muestra *Compensada* con las cancelaciones en orden inverso → `docker compose logs ordenes` → `docker compose exec db psql -U postgres -d hoteles -c "SELECT * FROM reservas"` (estado `CANCELADA`). |
@@ -632,6 +708,8 @@ Detalles relevantes: `depends_on` con `condition: service_healthy` evita que los
 | **Precios como `Float` en GraphQL.** Se almacenan y limpian como `NUMERIC`/`Decimal`, pero viajan como `float` en JSON y el total se suma en `float`. | Posibles errores de redondeo en centavos. | Escalar `Decimal` en Strawberry (serializado como texto) y sumar con `Decimal`. |
 | **Producto cartesiano de paquetes.** Se combinan todos los vuelos × hoteles × autos de la ciudad. | Con muchos datos, la respuesta crece rápido. | Paginación (`first`/`after`) y filtros en la query. |
 | **Sin reserva de inventario ni pago real.** | Las reservas no descuentan disponibilidad. | Paso de pago como participante adicional de la SAGA y control de cupos. |
+| **Sin fechas de viaje.** Se reserva por número de noches, sin fecha de ida. | No hay política de cancelación por fecha (se puede cancelar cualquier reserva confirmada). | Fechas de ida y vuelta en la búsqueda y una ventana de cancelación gratuita. |
+| **Los autos de Booking son un precio medio por ciudad**, no un modelo concreto. | El cliente ve "Auto estándar · precio medio en Booking". | Una fuente de alquiler de autos con modelos y disponibilidad. |
 | **Credenciales de desarrollo en `docker-compose.yml`** (`POSTGRES_PASSWORD: dev`) y HTTP sin TLS en local. | Aceptable solo en desarrollo. | Docker secrets o un gestor de secretos; TLS y `COOKIE_SECURE=true` en producción. |
 | **El scraper depende del HTML del sitio.** | Si Hostelworld cambia sus clases CSS, se guardan 0 hostales (el flow lo reporta como fallo). | Pruebas de contrato sobre HTML de ejemplo y alertas desde Prefect. |
 | **Trivago puede bloquear al bot o cambiar su HTML.** | Sin datos en vivo de Trivago para esa ciudad. | El respaldo con páginas guardadas cubre la demo; a largo plazo, la API de afiliados de Trivago. |

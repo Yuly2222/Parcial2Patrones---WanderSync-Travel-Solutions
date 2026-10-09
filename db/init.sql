@@ -10,6 +10,7 @@ CREATE DATABASE hoteles;
 CREATE DATABASE autos;
 CREATE DATABASE ordenes;
 CREATE DATABASE auth;      -- usuarios y sesiones (la usa el Gateway)
+CREATE DATABASE ofertas;   -- ofertas de Booking (servicio Ofertas; la tabla la crea el servicio al arrancar)
 CREATE DATABASE prefect;   -- historial de flows, tareas y logs del servidor de Prefect (no es de ningún microservicio)
 
 
@@ -26,9 +27,15 @@ CREATE TABLE vuelos (
     id      SERIAL PRIMARY KEY,
     origen  TEXT NOT NULL,           -- código IATA del aeropuerto, ej: BOG
     destino TEXT NOT NULL,
-    precio  NUMERIC(12, 2) NOT NULL  -- NUMERIC y no FLOAT: FLOAT redondea en binario (0.1 + 0.2 = 0.30000000000000004);
+    precio  NUMERIC(12, 2) NOT NULL, -- NUMERIC y no FLOAT: FLOAT redondea en binario (0.1 + 0.2 = 0.30000000000000004);
                                      -- con dinero eso descuadra cuentas. (12, 2) = hasta 12 dígitos, 2 decimales
+    destino_nombre TEXT,                         -- "Ciudad de México" (de la página de Booking)
+    pais        TEXT,
+    fuente      TEXT NOT NULL DEFAULT 'semilla',   -- 'semilla' | 'booking-muestra' (cargado por la ingesta)
+    actualizado TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Llave del UPSERT de la ingesta (los servicios también la crean al arrancar si la BD es anterior)
+CREATE UNIQUE INDEX vuelos_ruta_fuente ON vuelos (origen, destino, fuente);
 INSERT INTO vuelos (origen, destino, precio) VALUES
     ('BOG', 'MDE', 250000),
     ('BOG', 'CTG', 380000),
@@ -78,8 +85,11 @@ CREATE TABLE autos (
     id         SERIAL PRIMARY KEY,
     modelo     TEXT NOT NULL,
     ciudad     TEXT NOT NULL,
-    precio_dia NUMERIC(12, 2) NOT NULL
+    precio_dia NUMERIC(12, 2) NOT NULL,
+    fuente      TEXT NOT NULL DEFAULT 'semilla',   -- 'semilla' | 'booking-muestra' (precio medio de Booking)
+    actualizado TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX autos_ciudad_modelo ON autos (ciudad, modelo);
 INSERT INTO autos (modelo, ciudad, precio_dia) VALUES
     ('Kia Picanto',    'MDE', 120000),
     ('Renault Duster', 'CTG', 180000),
@@ -99,14 +109,24 @@ CREATE TABLE reservas (
 -- y la evidencia para la demo (se ve en qué paso iba y cómo terminó).
 CREATE TABLE sagas (
     id          UUID PRIMARY KEY,
+    usuario_id  INT,             -- dueño de la reserva ("Mis reservas"; solo él puede verla y cancelarla)
     vuelo_id    INT  NOT NULL,
     hotel_id    INT  NOT NULL,
-    auto_id     INT  NOT NULL,
+    auto_id     INT,             -- NULL = destino sin alquiler de autos (paquete vuelo + hotel)
     personas    INT  NOT NULL DEFAULT 1 CHECK (personas BETWEEN 1 AND 9),
-    estado      TEXT NOT NULL,   -- EN_CURSO | CONFIRMADA | COMPENSANDO | COMPENSADA | REQUIERE_ATENCION
+    noches      INT,
+    -- Resumen de lo reservado (Órdenes no puede leer las BD de los otros servicios: se lo manda el Gateway)
+    destino     TEXT,
+    vuelo       TEXT,            -- "BOG → MDE"
+    hotel       TEXT,
+    auto        TEXT,
+    total       NUMERIC(14, 2),  -- calculado en el Gateway, nunca enviado por el navegador
+    estado      TEXT NOT NULL,   -- EN_CURSO | CONFIRMADA | COMPENSANDO | COMPENSADA | CANCELANDO | CANCELADA | REQUIERE_ATENCION
     paso        TEXT,            -- descripción del último paso ejecutado
+    creado      TIMESTAMPTZ NOT NULL DEFAULT now(),
     actualizado TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX sagas_usuario ON sagas (usuario_id, creado DESC);
 
 
 -- ===================== AUTH (usuarios y sesiones del Gateway) =====================

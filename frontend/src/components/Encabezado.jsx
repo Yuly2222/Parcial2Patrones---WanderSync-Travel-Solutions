@@ -1,4 +1,4 @@
-// Barra superior: marca, acceso a la cuenta y, solo en modo demo (?demo), los paneles técnicos.
+// Barra superior (solo con sesión): marca, cuenta y, solo en modo demo (?demo), los paneles técnicos.
 import { DEMO } from "../formato";
 
 const host = typeof window !== "undefined" ? window.location.hostname : "localhost";
@@ -9,13 +9,13 @@ const PANELES = [
   { nombre: "GraphiQL", url: "/graphql", titulo: "Explorador del API Gateway" },
 ];
 
-export default function Encabezado({ usuario, onEntrar, onRegistrar, onSalir }) {
+export default function Encabezado({ usuario, onSalir }) {
   return (
     <header className="bg-noche text-papel">
-      <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-3 px-4 py-4 sm:px-6">
+      <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-3 gap-y-3 px-4 py-4 sm:gap-x-6 sm:px-6">
         <a href={DEMO ? "/?demo" : "/"} className="flex items-center gap-2.5">
-          <img src="/favicon.svg" alt="" className="size-8" />
-          <span className="font-display text-xl font-semibold tracking-tight">WanderSync</span>
+          <img src="/favicon.svg" alt="" className="size-7 sm:size-8" />
+          <span className="font-display text-lg font-semibold tracking-tight sm:text-xl">WanderSync</span>
         </a>
 
         {DEMO && (
@@ -35,36 +35,24 @@ export default function Encabezado({ usuario, onEntrar, onRegistrar, onSalir }) 
           </nav>
         )}
 
-        <div className="ml-auto flex items-center gap-2 text-sm">
-          {usuario ? (
-            <>
-              <span className="hidden items-center gap-2 text-niebla sm:flex">
-                <span className="size-2 rounded-full bg-musgo" aria-hidden="true" />
-                {usuario.email}
-              </span>
-              <button
-                onClick={onSalir}
-                className="rounded-md border border-acero px-3 py-1.5 font-medium transition hover:border-bruma"
-              >
-                Cerrar sesión
-              </button>
-            </>
-          ) : (
-            <>
-              <button
-                onClick={onEntrar}
-                className="rounded-md px-3 py-1.5 font-medium text-niebla transition hover:bg-acero/60 hover:text-papel"
-              >
-                Iniciar sesión
-              </button>
-              <button
-                onClick={onRegistrar}
-                className="rounded-md bg-musgo px-3.5 py-1.5 font-semibold text-noche transition hover:bg-[#a5bb48]"
-              >
-                Crear cuenta
-              </button>
-            </>
-          )}
+        <div className="ml-auto flex items-center gap-2 text-sm sm:gap-3">
+          <a
+            href="#titulo-mis-reservas"
+            className="rounded-md px-2 py-1.5 font-medium whitespace-nowrap text-niebla transition hover:bg-acero/60 hover:text-papel sm:px-2.5"
+          >
+            Mis reservas
+          </a>
+          <span className="hidden items-center gap-2 text-niebla sm:flex">
+            <span className="size-2 rounded-full bg-musgo" aria-hidden="true" />
+            {usuario.email}
+          </span>
+          <button
+            onClick={onSalir}
+            className="rounded-md border border-acero px-3 py-1.5 font-medium transition hover:border-bruma"
+          >
+            <span className="sm:hidden">Salir</span>
+            <span className="hidden sm:inline">Cerrar sesión</span>
+          </button>
         </div>
       </div>
     </header>

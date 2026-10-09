@@ -4,3 +4,5 @@ node_modules/
 dist/
 ingesta/muestras/*.html
 ingesta/muestras/*_files/
+ingesta/muestras/booking/*.html
+ingesta/muestras/**/*_files/
