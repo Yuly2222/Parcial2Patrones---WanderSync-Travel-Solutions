@@ -16,6 +16,4 @@ COPY . .
 
 # Comando al arrancar el contenedor: uvicorn sirve la variable "app" del archivo "main.py".
 # --host 0.0.0.0 es obligatorio: con 127.0.0.1 solo se aceptarían conexiones desde dentro del propio contenedor
-# --no-proxy-headers: uvicorn NO reescribe la IP del cliente con X-Forwarded-For. La IP real la decide seguridad.py,
-# que solo le cree a esa cabecera cuando viene del contenedor frontend (rate limiting y cookie Secure).
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

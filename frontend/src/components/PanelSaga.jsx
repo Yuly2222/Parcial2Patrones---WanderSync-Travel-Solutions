@@ -18,6 +18,8 @@ const ESTADO_SAGA = {
   REQUIERE_ATENCION: { texto: "Requiere atención", clase: "bg-[#b4553f]/15 text-[#9b4533]" },
   EN_CURSO: { texto: "En curso", clase: "bg-niebla/60 text-acero" },
   COMPENSANDO: { texto: "Compensando", clase: "bg-niebla/60 text-acero" },
+  CANCELANDO: { texto: "Cancelando", clase: "bg-niebla/60 text-acero" },
+  CANCELADA: { texto: "Cancelada por el cliente", clase: "bg-niebla/60 text-acero" },
 };
 
 export default function PanelSaga({ saga }) {
@@ -41,7 +43,7 @@ export default function PanelSaga({ saga }) {
   }
 
   const enCurso = saga.estado === "PENDIENTE";
-  const { pasos, compensaciones } = lineaDeTiempo(enCurso ? "EN_CURSO" : saga.estado, saga.paso);
+  const { pasos, compensaciones } = lineaDeTiempo(enCurso ? "EN_CURSO" : saga.estado, saga.paso, saga.auto !== null);
   const insignia = ESTADO_SAGA[saga.estado] ?? { texto: "Enviando…", clase: "bg-niebla/60 text-acero pulso" };
 
   return (

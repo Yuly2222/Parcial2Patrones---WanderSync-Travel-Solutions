@@ -1,13 +1,31 @@
 # Microservicio de Autos. Misma estructura que vuelos/main.py (ver los comentarios detallados allá),
 # más el interruptor para SIMULAR UN FALLO y demostrar las compensaciones de la SAGA.
 import os
+from contextlib import asynccontextmanager
 from uuid import UUID
 import psycopg
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI()
 DB = os.environ["DATABASE_URL"]  # apunta a la base de datos "autos"
+
+# Migración idempotente al arrancar (ver vuelos/main.py). La ingesta carga el precio medio de alquiler
+# de Booking por ciudad con UPSERT por (ciudad, modelo).
+MIGRACION = """
+ALTER TABLE autos ADD COLUMN IF NOT EXISTS fuente TEXT NOT NULL DEFAULT 'semilla';
+ALTER TABLE autos ADD COLUMN IF NOT EXISTS actualizado TIMESTAMPTZ NOT NULL DEFAULT now();
+CREATE UNIQUE INDEX IF NOT EXISTS autos_ciudad_modelo ON autos (ciudad, modelo);
+"""
+
+
+@asynccontextmanager
+async def ciclo_de_vida(app):
+    with psycopg.connect(DB) as conn:
+        conn.execute(MIGRACION)
+    yield
+
+
+app = FastAPI(lifespan=ciclo_de_vida)
 
 # Interruptor de la demo: si la variable de entorno vale "true", toda reserva de auto falla.
 # Se controla desde docker-compose.yml (ver el README / instrucciones de la demo).
@@ -24,10 +42,20 @@ def health():
 def listar_autos(ciudad: str | None = None):
     with psycopg.connect(DB) as conn:
         filas = conn.execute(
-            "SELECT id, modelo, ciudad, precio_dia FROM autos WHERE %s::text IS NULL OR ciudad = %s",
+            "SELECT id, modelo, ciudad, precio_dia, fuente FROM autos WHERE %s::text IS NULL OR ciudad = %s "
+            "ORDER BY precio_dia",
             (ciudad, ciudad),
         ).fetchall()
-    return [{"id": f[0], "modelo": f[1], "ciudad": f[2], "precio_dia": f[3]} for f in filas]
+    return [{"id": f[0], "modelo": f[1], "ciudad": f[2], "precio_dia": f[3], "fuente": f[4]} for f in filas]
+
+
+@app.get("/autos/{auto_id}")
+def ver_auto(auto_id: int):
+    with psycopg.connect(DB) as conn:
+        f = conn.execute("SELECT id, modelo, ciudad, precio_dia, fuente FROM autos WHERE id = %s", (auto_id,)).fetchone()
+    if f is None:
+        raise HTTPException(status_code=404, detail="Auto no encontrado")
+    return {"id": f[0], "modelo": f[1], "ciudad": f[2], "precio_dia": f[3], "fuente": f[4]}
 
 
 class Reserva(BaseModel):

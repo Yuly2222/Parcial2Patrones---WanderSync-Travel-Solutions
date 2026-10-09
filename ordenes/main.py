@@ -4,20 +4,65 @@
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
+from decimal import Decimal
 import httpx                    # Cliente HTTP para llamar a los otros microservicios
 import psycopg
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI()
 DB = os.environ["DATABASE_URL"]  # apunta a la base de datos "ordenes" (tabla sagas)
+
+# Migración idempotente al arrancar (db/init.sql solo corre al crear el volumen por primera vez).
+# Cada SAGA queda ligada a su usuario (para "Mis reservas") y guarda un resumen de lo reservado:
+# Órdenes no puede consultar las BD de los otros servicios (database per service), así que el Gateway
+# le manda ese resumen al crear la orden.
+MIGRACION = """
+ALTER TABLE sagas ALTER COLUMN auto_id DROP NOT NULL;            -- destinos sin alquiler de autos
+ALTER TABLE sagas ADD COLUMN IF NOT EXISTS usuario_id INT;
+ALTER TABLE sagas ADD COLUMN IF NOT EXISTS noches     INT;
+ALTER TABLE sagas ADD COLUMN IF NOT EXISTS destino    TEXT;
+ALTER TABLE sagas ADD COLUMN IF NOT EXISTS vuelo      TEXT;
+ALTER TABLE sagas ADD COLUMN IF NOT EXISTS hotel      TEXT;
+ALTER TABLE sagas ADD COLUMN IF NOT EXISTS auto       TEXT;
+ALTER TABLE sagas ADD COLUMN IF NOT EXISTS total      NUMERIC(14, 2);
+ALTER TABLE sagas ADD COLUMN IF NOT EXISTS creado     TIMESTAMPTZ NOT NULL DEFAULT now();
+CREATE INDEX IF NOT EXISTS sagas_usuario ON sagas (usuario_id, creado DESC);
+"""
+
+
+@asynccontextmanager
+async def ciclo_de_vida(app):
+    with psycopg.connect(DB) as conn:
+        conn.execute(MIGRACION)
+    yield
+
+
+app = FastAPI(lifespan=ciclo_de_vida)
 
 
 class Orden(BaseModel):
+    usuario_id: int
     vuelo_id: int
     hotel_id: int
-    auto_id: int
+    auto_id: int | None = None                     # None = destino sin alquiler de autos (paquete vuelo + hotel)
     personas: int = Field(default=1, ge=1, le=9)   # Field valida el rango: fuera de 1-9 FastAPI responde 422
+    noches: int = Field(default=1, ge=1, le=30)
+    # Resumen para "Mis reservas" (lo arma el Gateway con los datos de cada servicio y el precio calculado allí)
+    destino: str
+    vuelo: str
+    hotel: str
+    auto: str | None = None
+    total: Decimal
+
+
+# Columnas que se devuelven al consultar una orden (mismo orden en el SELECT y en el diccionario)
+CAMPOS = ("estado", "paso", "actualizado", "personas", "noches", "destino", "vuelo", "hotel", "auto", "total", "creado")
+SELECT = f"SELECT id, {', '.join(CAMPOS)} FROM sagas"
+
+
+def a_dict(fila):
+    return {"saga_id": fila[0], **dict(zip(CAMPOS, fila[1:]))}
 
 
 def guardar_estado(saga_id, estado, paso):
@@ -55,17 +100,20 @@ def crear_orden(orden: Orden):
     # 1) Registrar la SAGA antes de empezar
     with psycopg.connect(DB) as conn:
         conn.execute(
-            "INSERT INTO sagas (id, vuelo_id, hotel_id, auto_id, personas, estado, paso) "
-            "VALUES (%s, %s, %s, %s, %s, 'EN_CURSO', 'inicio')",
-            (saga_id, orden.vuelo_id, orden.hotel_id, orden.auto_id, orden.personas),
+            "INSERT INTO sagas (id, usuario_id, vuelo_id, hotel_id, auto_id, personas, noches, "
+            "destino, vuelo, hotel, auto, total, estado, paso) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'EN_CURSO', 'inicio')",
+            (saga_id, orden.usuario_id, orden.vuelo_id, orden.hotel_id, orden.auto_id, orden.personas,
+             orden.noches, orden.destino, orden.vuelo, orden.hotel, orden.auto, orden.total),
         )
 
     # 2) Los pasos de la SAGA, EN ORDEN: (servicio, datos que necesita para reservar)
     pasos = [
         ("vuelos",  {"vuelo_id": orden.vuelo_id}),
         ("hoteles", {"hotel_id": orden.hotel_id}),
-        ("autos",   {"auto_id": orden.auto_id}),
     ]
+    if orden.auto_id is not None:   # paquete con auto (en San Andrés o Pereira no hay alquiler)
+        pasos.append(("autos", {"auto_id": orden.auto_id}))
 
     intentados = []  # pila de servicios a los que ya les pedimos reservar
     for servicio, datos in pasos:
@@ -98,17 +146,63 @@ def crear_orden(orden: Orden):
             return {"saga_id": saga_id, "estado": estado}
 
     # 4) Happy path: todos los pasos salieron bien
-    guardar_estado(saga_id, "CONFIRMADA", "vuelo, hotel y auto reservados")
+    guardar_estado(saga_id, "CONFIRMADA", "vuelo, hotel y auto reservados" if orden.auto_id else "vuelo y hotel reservados")
     return {"saga_id": saga_id, "estado": "CONFIRMADA"}
 
 
-# Consultar cómo va / cómo terminó una SAGA
+# Reservas de un usuario, la más reciente primero ("Mis reservas")
+@app.get("/ordenes")
+def listar_ordenes(usuario_id: int):
+    with psycopg.connect(DB) as conn:
+        filas = conn.execute(f"{SELECT} WHERE usuario_id = %s ORDER BY creado DESC LIMIT 50", (usuario_id,)).fetchall()
+    return [a_dict(f) for f in filas]
+
+
+# Consultar cómo va / cómo terminó una SAGA.
+# usuario_id: el Gateway lo manda siempre, así nadie puede ver la reserva de otra persona adivinando su id
+# (para quien no es el dueño, la reserva "no existe": 404, sin revelar que sí existe).
 @app.get("/ordenes/{saga_id}")
-def ver_orden(saga_id: uuid.UUID):
+def ver_orden(saga_id: uuid.UUID, usuario_id: int | None = None):
     with psycopg.connect(DB) as conn:
         fila = conn.execute(
-            "SELECT estado, paso, actualizado, personas FROM sagas WHERE id = %s", (saga_id,)
+            f"{SELECT} WHERE id = %s AND (%s::int IS NULL OR usuario_id = %s)", (saga_id, usuario_id, usuario_id)
         ).fetchone()
     if fila is None:
         raise HTTPException(status_code=404, detail="Orden no encontrada")
-    return {"saga_id": saga_id, "estado": fila[0], "paso": fila[1], "actualizado": fila[2], "personas": fila[3]}
+    return a_dict(fila)
+
+
+class Cancelacion(BaseModel):
+    usuario_id: int
+
+
+# CANCELAR una reserva confirmada: es la misma lógica de compensación de la SAGA, pedida por el cliente.
+# Se cancela en orden inverso (auto -> hotel -> vuelo) y cada cancelación es idempotente y con reintentos.
+@app.post("/ordenes/{saga_id}/cancelar")
+def cancelar_orden(saga_id: uuid.UUID, c: Cancelacion):
+    with psycopg.connect(DB) as conn:
+        # Transición ATÓMICA CONFIRMADA -> CANCELANDO: si llegan dos cancelaciones a la vez (doble clic, dos
+        # pestañas), solo una encuentra la fila en CONFIRMADA; la otra recibe 409. Nada se cancela dos veces.
+        fila = conn.execute(
+            "UPDATE sagas SET estado = 'CANCELANDO', paso = 'cancelación pedida por el cliente', actualizado = now() "
+            "WHERE id = %s AND usuario_id = %s AND estado = 'CONFIRMADA' RETURNING auto_id",
+            (saga_id, c.usuario_id),
+        ).fetchone()
+        if fila is None:
+            actual = conn.execute(
+                "SELECT estado FROM sagas WHERE id = %s AND usuario_id = %s", (saga_id, c.usuario_id)
+            ).fetchone()
+    if fila is None:
+        if actual is None:
+            raise HTTPException(status_code=404, detail="Orden no encontrada")
+        raise HTTPException(status_code=409, detail=f"Solo se puede cancelar una reserva confirmada (estado: {actual[0]})")
+    print(f"[SAGA {saga_id}] CANCELANDO: pedido del cliente", flush=True)
+
+    servicios = ["autos", "hoteles", "vuelos"] if fila[0] is not None else ["hoteles", "vuelos"]
+    sin_cancelar = [s for s in servicios if not compensar(s, saga_id)]
+    if sin_cancelar:
+        guardar_estado(saga_id, "REQUIERE_ATENCION", f"cancelación del cliente; no se pudo cancelar: {sin_cancelar}")
+    else:
+        guardar_estado(saga_id, "CANCELADA", "cancelada por el cliente: " + ", ".join(servicios) + " liberados")
+    with psycopg.connect(DB) as conn:
+        return a_dict(conn.execute(f"{SELECT} WHERE id = %s", (saga_id,)).fetchone())

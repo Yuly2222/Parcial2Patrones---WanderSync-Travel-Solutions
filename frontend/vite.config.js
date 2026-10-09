@@ -8,6 +8,8 @@ import tailwindcss from "@tailwindcss/vite";
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
+    // Permite abrir el servidor de desarrollo por la URL pública del túnel (plan B, ver README)
+    allowedHosts: [".trycloudflare.com"],
     proxy: {
       "/graphql": { target: "http://localhost:8000", changeOrigin: true },
     },

@@ -10,7 +10,9 @@
 # Fuente 2: Trivago (trivago.com.co), descargado en vivo: páginas de destino /es-CO/odr/..., que su
 #           robots.txt permite (ver trivago.py). Si Trivago bloquea al bot en una ciudad, se usa como
 #           RESPALDO la página de esa ciudad guardada a mano en muestras/trivago/.
-# (Booking.com se probó primero: responde con un desafío anti-bot de AWS WAF; evadirlo no es aceptable.)
+# Fuente 3: ofertas de Booking.com por categoría (alojamiento, vuelos, coches, atracciones), desde
+#           páginas guardadas a mano: Booking responde con un desafío anti-bot (AWS WAF) incluso a su robots.txt,
+#           así que no se intenta ninguna descarga automática (ver booking.py). Van a la BD del servicio Ofertas.
 #
 # Scraping responsable:
 #   - Se lee y respeta robots.txt antes de descargar.
@@ -36,12 +38,51 @@ from prefect import flow, task, unmapped
 from prefect_dask import DaskTaskRunner
 
 import trivago   # fuente 2: Trivago, descarga en vivo + muestras guardadas de respaldo (ver trivago.py)
+import booking   # fuente 3: ofertas de Booking desde páginas guardadas (ver booking.py)
+import robots_cache   # robots.txt cacheado por worker (módulo aparte: ver por qué en robots_cache.py)
 
 UA = "WanderSync-academic-bot/0.1 (proyecto universitario)"
 BASE = "https://www.hostelworld.com"
 
-# Código de ciudad (el mismo que usan las tablas de vuelos y autos) -> nombre de la ciudad en la URL del sitio
-CIUDADES = {"MDE": "medellin", "CTG": "cartagena", "SMR": "santa-marta"}
+# Código de ciudad (IATA, el mismo que usan las tablas de vuelos y autos) -> ruta de la ciudad en Hostelworld
+# (/hostels/<ruta>/). Son destinos con vuelo desde Bogotá en la página de Booking que TAMBIÉN tienen alojamientos
+# en Hostelworld: con vuelo + alojamiento hay paquete. (Cúcuta, Montería o Valledupar no entran: Hostelworld no
+# tiene alojamientos allá.) Las rutas se tomaron de los enlaces del propio Hostelworld.
+CIUDADES = {
+    # Colombia
+    "MDE": "south-america/colombia/medellin",
+    "CTG": "south-america/colombia/cartagena",
+    "SMR": "south-america/colombia/santa-marta",
+    "CLO": "south-america/colombia/cali",
+    "BAQ": "south-america/colombia/barranquilla",
+    "BGA": "south-america/colombia/bucaramanga",
+    "PEI": "south-america/colombia/pereira",
+    "ADZ": "south-america/colombia/san-andres-island",
+    "AXM": "south-america/colombia/armenia",
+    "LET": "south-america/colombia/leticia",
+    "RCH": "south-america/colombia/riohacha",
+    "NVA": "south-america/colombia/neiva",
+    "IBE": "south-america/colombia/ibague",
+    "PSO": "south-america/colombia/pasto",
+    # Latinoamérica y Norteamérica
+    "LIM": "south-america/peru/lima",
+    "UIO": "south-america/ecuador/quito",
+    "BUE": "south-america/argentina/buenos-aires",
+    "PTY": "north-america/panama/panama-city",
+    "MEX": "north-america/mexico/mexico-city",
+    "CUN": "north-america/mexico/cancun",
+    "MIA": "north-america/usa/miami",
+    "NYC": "north-america/usa/new-york",
+    "ORL": "north-america/usa/orlando",
+    "LAX": "north-america/usa/los-angeles",
+    # Europa
+    "MAD": "europe/spain/madrid",
+    "BCN": "europe/spain/barcelona",
+    "PAR": "europe/france/paris",
+    "ROM": "europe/italy/rome",
+    "LON": "europe/england/london",
+    "AMS": "europe/netherlands/amsterdam",
+}
 
 DB = os.environ["DATABASE_URL"]                                  # BD "hoteles"
 DASK_SCHEDULER = os.environ["DASK_SCHEDULER"]                    # tcp://dask-scheduler:8786
@@ -49,6 +90,13 @@ DASK_SCHEDULER = os.environ["DASK_SCHEDULER"]                    # tcp://dask-sc
 PROB_FALLO = float(os.environ.get("PROB_FALLO_SCRAPER", "0"))
 # Carpeta con las páginas de Trivago guardadas a mano (montada como volumen: agregar una muestra no exige rebuild)
 MUESTRAS_TRIVAGO = Path(os.environ.get("MUESTRAS_TRIVAGO", "muestras/trivago"))
+# Páginas de ofertas de Booking: muestras/booking/recortadas/booking-<categoria>.html (las que se suben al repo)
+# o, si no se han recortado, muestras/booking/booking-<categoria>.html tal como se guardaron
+MUESTRAS_BOOKING = Path(os.environ.get("MUESTRAS_BOOKING", "muestras/booking"))
+OFERTAS_DB = os.environ.get("OFERTAS_DATABASE_URL")              # BD del servicio Ofertas
+# Los vuelos desde Bogotá y el precio medio de alquiler de autos de Booking también alimentan el catálogo
+# de los servicios Vuelos y Autos: así hay paquetes reservables en todos los destinos de CIUDADES.
+CATALOGO_DB = {"vuelos": os.environ.get("VUELOS_DATABASE_URL"), "coches": os.environ.get("AUTOS_DATABASE_URL")}
 
 
 # ---------------------------------------------------------------- TAREAS
@@ -59,14 +107,17 @@ class Bloqueado(RuntimeError):
     """El sitio rechazó al bot (403/429 o desafío anti-bot). No se evade ni se reintenta."""
 
 
+HEADERS = {"User-Agent": UA, "Accept-Language": "es-CO,es;q=0.9"}
+
+
 def obtener_html(base: str, url: str) -> str:
     """Descarga responsable, común a todas las fuentes en vivo:
     lee robots.txt, se identifica honestamente y falla si el sitio se defiende."""
-    headers = {"User-Agent": UA, "Accept-Language": "es-CO,es;q=0.9"}
+    headers = HEADERS
 
     # 1. Respetar robots.txt: si el sitio no permite esa ruta a los bots, no se descarga.
-    robots = httpx.get(f"{base}/robots.txt", headers=headers, timeout=15)
-    reglas = Protego.parse(robots.text)
+    # (robots_cache: se lee una vez por sitio y por worker cada 30 min, no una vez por ciudad)
+    reglas = robots_cache.reglas(base, UA)
     if not reglas.can_fetch(url, UA):
         raise PermissionError(f"robots.txt no permite descargar {url}")
 
@@ -103,7 +154,7 @@ def _reintentable(task, task_run, state) -> bool:
 @task(retries=3, retry_delay_seconds=[5, 15, 45], retry_condition_fn=_reintentable)
 def descargar(codigo: str) -> str:
     """Paso 1 (scraping): descarga el HTML de la página de hostales de una ciudad en Hostelworld."""
-    return obtener_html(BASE, f"{BASE}/hostels/south-america/colombia/{CIUDADES[codigo]}/")
+    return obtener_html(BASE, f"{BASE}/hostels/{CIUDADES[codigo]}/")
 
 
 @task(retries=3, retry_delay_seconds=[5, 15, 45], retry_condition_fn=_reintentable)
@@ -153,10 +204,97 @@ def estructurar_trivago(html: str, codigo: str, origen: str, fuente: str) -> lis
 
 
 @task
+def estructurar_booking(html: str, categoria: str, archivo: str) -> list[dict]:
+    """Paso 2 (estructuración) para Booking: página de ofertas guardada -> una oferta por destino."""
+    ofertas = booking.parsear(html, categoria)
+    print(f"Booking {booking.CATEGORIAS[categoria]}: {len(ofertas)} ofertas leídas de {archivo}")
+    if not ofertas:
+        raise ValueError(f"0 ofertas en {archivo}: ¿es la página de ofertas? ¿Booking cambió su HTML?")
+    return ofertas
+
+
+@task
+def limpiar_ofertas(ofertas: list[dict]) -> list[dict]:
+    """Paso 3 (limpieza) para ofertas: 'COP 325.300' -> Decimal(325300); descarta precios inválidos."""
+    limpias = []
+    for o in ofertas:
+        precio = booking.precio_cop(o["precio"])
+        if precio is None or precio < 1000:
+            continue
+        limpias.append({**o, "precio": Decimal(precio)})
+    return limpias
+
+
+@task(retries=2, retry_delay_seconds=10)
+def guardar_ofertas(ofertas: list[dict], categoria: str) -> int:
+    """Paso 4 (ingesta) en la BD del servicio Ofertas: UPSERT en lote por (categoria, llave), y se borran las
+    ofertas de esa categoría que ya no están en la página (la sección refleja la página guardada más reciente).
+    Todo en UNA transacción: quien consulta nunca ve la categoría a medio actualizar.
+    retries: la primera vez, la tabla la crea el servicio Ofertas al arrancar; si la ingesta llega antes, reintenta."""
+    with psycopg.connect(OFERTAS_DB) as conn, conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO ofertas (categoria, llave, destino, ciudad, titulo, detalle, cantidad, precio_desde, unidad, campana, url, actualizado)
+            VALUES (%(categoria)s, %(llave)s, %(destino)s, %(ciudad)s, %(titulo)s, %(detalle)s, %(cantidad)s, %(precio)s, %(unidad)s, %(campana)s, %(url)s, now())
+            ON CONFLICT (categoria, llave) DO UPDATE
+               SET destino = EXCLUDED.destino, ciudad = EXCLUDED.ciudad, titulo = EXCLUDED.titulo,
+                   detalle = EXCLUDED.detalle, cantidad = EXCLUDED.cantidad,
+                   precio_desde = EXCLUDED.precio_desde, unidad = EXCLUDED.unidad,
+                   campana = EXCLUDED.campana, url = EXCLUDED.url, actualizado = now()
+            """,
+            ofertas,
+        )
+        cur.execute(
+            "DELETE FROM ofertas WHERE categoria = %s AND NOT (llave = ANY(%s))",
+            (categoria, [o["llave"] for o in ofertas]),
+        )
+    print(f"Booking {booking.CATEGORIAS[categoria]}: {len(ofertas)} ofertas guardadas/actualizadas")
+    return len(ofertas)
+
+
+@task(retries=2, retry_delay_seconds=10)
+def guardar_catalogo(ofertas: list[dict], categoria: str) -> int:
+    """Paso 4b: las ofertas de Booking de ciudades del sistema pasan al catálogo reservable.
+    vuelos -> tabla vuelos (BOG -> destino, precio por persona); coches -> tabla autos (precio medio al día).
+    UPSERT por (origen, destino, fuente) / (ciudad, modelo): re-procesar actualiza el precio, no duplica."""
+    if categoria == "vuelos":
+        filas = [
+            {"origen": booking.codigo_origen(o["titulo"]), "destino": o["ciudad"], "precio": o["precio"],
+             "nombre": o["destino"], "pais": o["detalle"]}
+            for o in ofertas if o["ciudad"] and booking.codigo_origen(o["titulo"])
+        ]
+        sql = """
+            INSERT INTO vuelos (origen, destino, precio, destino_nombre, pais, fuente, actualizado)
+            VALUES (%(origen)s, %(destino)s, %(precio)s, %(nombre)s, %(pais)s, 'booking-muestra', now())
+            ON CONFLICT (origen, destino, fuente) DO UPDATE
+               SET precio = EXCLUDED.precio, destino_nombre = EXCLUDED.destino_nombre, pais = EXCLUDED.pais,
+                   actualizado = now()
+        """
+    else:
+        filas = [
+            {"ciudad": o["ciudad"], "modelo": "Auto estándar · precio medio en Booking", "precio": o["precio"]}
+            for o in ofertas if o["ciudad"]
+        ]
+        sql = """
+            INSERT INTO autos (modelo, ciudad, precio_dia, fuente, actualizado)
+            VALUES (%(modelo)s, %(ciudad)s, %(precio)s, 'booking-muestra', now())
+            ON CONFLICT (ciudad, modelo) DO UPDATE SET precio_dia = EXCLUDED.precio_dia, actualizado = now()
+        """
+    with psycopg.connect(CATALOGO_DB[categoria]) as conn, conn.cursor() as cur:
+        cur.executemany(sql, filas)
+    print(f"Catálogo {categoria}: {len(filas)} filas desde Booking")
+    return len(filas)
+
+
+@task
 def limpiar(registros: list[dict]) -> list[dict]:
     """Paso 3 (limpieza): convierte textos a números y descarta datos inválidos."""
     limpios = []
     for r in registros:
+        # Hostelworld muestra el precio en la moneda del visitante ("CO$58349.63"). Si llegara en otra moneda
+        # (€, US$...), no se convierte a ojo: se descarta, para no guardar euros como si fueran pesos.
+        if r["fuente"] == "hostelworld" and not r["precio"].strip().upper().startswith(("CO$", "COP")):
+            continue
         try:
             # "CO$58,349.63" -> "58349.63" -> Decimal (exacto, igual que NUMERIC en la BD)
             precio = Decimal(re.sub(r"[^\d.]", "", r["precio"]))
@@ -213,14 +351,16 @@ def ingesta_hoteles(ciudades: list[str] = list(CIUDADES)):
 
     # Fuente 2: Trivago en vivo, la misma cadena de 4 tareas por ciudad, en paralelo con Hostelworld.
     # unmapped(...) = el mismo valor para todas las ciudades (no se reparte elemento a elemento).
-    htmls_t = descargar_trivago.map(ciudades)
-    crudos_t = estructurar_trivago.map(htmls_t, ciudades, unmapped("en vivo"), unmapped("trivago"))
-    guardados_t = guardar.map(limpiar.map(crudos_t), ciudades)
+    # Solo para las ciudades que tienen página de destino conocida en Trivago (ver trivago.DESTINOS).
+    ciudades_t = [c for c in ciudades if c in trivago.DESTINOS]
+    htmls_t = descargar_trivago.map(ciudades_t)
+    crudos_t = estructurar_trivago.map(htmls_t, ciudades_t, unmapped("en vivo"), unmapped("trivago"))
+    guardados_t = guardar.map(limpiar.map(crudos_t), ciudades_t)
 
     # Resumen: una ciudad o fuente que falle (tras agotar sus retries) no tumba a las demás
     total = 0
     trivago_fallo = []
-    for etiqueta, futuro in [*zip(ciudades, guardados), *((f"{c} (trivago)", g) for c, g in zip(ciudades, guardados_t))]:
+    for etiqueta, futuro in [*zip(ciudades, guardados), *((f"{c} (trivago)", g) for c, g in zip(ciudades_t, guardados_t))]:
         try:
             total += futuro.result()
         except Exception as e:
@@ -250,9 +390,45 @@ def ingesta_hoteles(ciudades: list[str] = list(CIUDADES)):
     if sin_respaldo:
         print(f"Trivago sin datos para {sin_respaldo}: no hay muestra guardada de respaldo (ver muestras/trivago/LEEME.md)")
 
+    print(f"TOTAL: {total} alojamientos ingeridos (Hostelworld + Trivago)")
+
+    # Fuente 3: ofertas de Booking, una cadena estructurar -> limpiar -> guardar por categoría, en paralelo en Dask.
+    # Es independiente de los hoteles: se procesa aunque las fuentes de hoteles hayan fallado. Y un fallo aquí NO
+    # marca el flow como fallido: las ofertas son un extra de la página, no parte de los paquetes.
+    paginas = []
+    for categoria in booking.CATEGORIAS:
+        for archivo in (MUESTRAS_BOOKING / "recortadas" / f"booking-{categoria}.html", MUESTRAS_BOOKING / f"booking-{categoria}.html"):
+            if archivo.exists():
+                paginas.append((categoria, archivo.name, archivo.read_text(encoding="utf-8")))
+                break
+    if paginas and not OFERTAS_DB:
+        print("Hay páginas de Booking pero falta OFERTAS_DATABASE_URL: no se guardan las ofertas")
+    elif paginas:
+        categorias = [p[0] for p in paginas]
+        crudas = estructurar_booking.map([p[2] for p in paginas], categorias, [p[1] for p in paginas])
+        limpias = limpiar_ofertas.map(crudas)
+        guardadas = guardar_ofertas.map(limpias, categorias)
+        # vuelos y coches de ciudades del sistema -> catálogo de los servicios Vuelos y Autos (en paralelo)
+        catalogo = [
+            (c, guardar_catalogo.submit(l, c)) for c, l in zip(categorias, limpias) if CATALOGO_DB.get(c)
+        ]
+        ofertas = 0
+        for categoria, futuro in zip(categorias, guardadas):
+            try:
+                ofertas += futuro.result()
+            except Exception as e:
+                print(f"Booking {categoria}: falló -> {e}")
+        for categoria, futuro in catalogo:
+            try:
+                futuro.result()
+            except Exception as e:
+                print(f"Catálogo {categoria}: falló -> {e}")
+        faltan = [c for c in booking.CATEGORIAS if c not in categorias]
+        print(f"OFERTAS: {ofertas} ofertas de Booking en {len(categorias)} categorías"
+              + (f" (sin página guardada: {', '.join(faltan)})" if faltan else ""))
+
     if total == 0:
         raise RuntimeError("No se pudo ingerir ninguna ciudad")   # el flow queda en estado Failed en el panel
-    print(f"TOTAL: {total} alojamientos ingeridos (Hostelworld + Trivago)")
     return total
 
 

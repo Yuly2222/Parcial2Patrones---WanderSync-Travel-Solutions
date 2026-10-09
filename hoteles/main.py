@@ -2,7 +2,7 @@
 import os
 from uuid import UUID
 import psycopg
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -27,6 +27,25 @@ def listar_hoteles(ciudad: str | None = None):
         {"id": f[0], "nombre": f[1], "ciudad": f[2], "precio_noche": f[3], "rating": f[4], "fuente": f[5]}
         for f in filas
     ]
+
+
+@app.get("/hoteles/{hotel_id}")
+def ver_hotel(hotel_id: int):
+    with psycopg.connect(DB) as conn:
+        f = conn.execute(
+            "SELECT id, nombre, ciudad, precio_noche, rating, fuente FROM hoteles WHERE id = %s", (hotel_id,)
+        ).fetchone()
+    if f is None:
+        raise HTTPException(status_code=404, detail="Hotel no encontrado")
+    return {"id": f[0], "nombre": f[1], "ciudad": f[2], "precio_noche": f[3], "rating": f[4], "fuente": f[5]}
+
+
+# Ciudades con al menos un alojamiento (el Gateway las cruza con los destinos que tienen vuelo)
+@app.get("/ciudades")
+def listar_ciudades():
+    with psycopg.connect(DB) as conn:
+        filas = conn.execute("SELECT DISTINCT ciudad FROM hoteles ORDER BY ciudad").fetchall()
+    return [f[0] for f in filas]
 
 
 class Reserva(BaseModel):
